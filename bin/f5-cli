@@ -231,14 +231,16 @@ route_count() {
   fi
 }
 
-# The resolvers in use: svpn rewrites /etc/resolv.conf on Linux, and on macOS
-# pushes its servers into the system configuration as the first resolver.
+# The VPN's resolvers: svpn rewrites /etc/resolv.conf on Linux. On macOS it
+# publishes them as a service of its own in the system configuration, which
+# macOS uses as split DNS for the VPN's domains, leaving the default resolver
+# alone.
 dns_servers() {
   if [ "$OS" = Darwin ]; then
-    scutil --dns 2>/dev/null | awk '
-      /^DNS configuration \(for scoped/ { exit }
-      /^resolver #/ { r++ }
-      r == 1 && /nameserver\[/ { printf " %s", $3 }'
+    printf 'show State:/Network/Service/F5NetworksServicePPP/DNS\n' | scutil 2>/dev/null | awk '
+      /ServerAddresses/ { f = 1; next }
+      f && /}/ { exit }
+      f { printf " %s", $3 }'
   else
     awk '/^nameserver/{printf " %s", $2}' /etc/resolv.conf
   fi
@@ -276,9 +278,9 @@ require_browser() {
 }
 
 # Chromium encrypts cookies under a key from the OS keyring. On Linux,
-# --password-store=basic makes that a fixed key; on macOS the key would live
-# in the login Keychain, behind a prompt, and --use-mock-keychain swaps in a
-# fixed one instead. Either way read_sid can decrypt the cookie unaided.
+# --password-store=basic makes that a fixed key, so read_sid can decrypt the
+# cookie unaided. On macOS the key would live in the login Keychain, behind a
+# prompt that a headless run can't answer; --use-mock-keychain keeps it out.
 set_browser_args() {
   BROWSER_ARGS=("--user-data-dir=$PROFILE" --no-first-run --no-default-browser-check)
   if [ "$OS" = Darwin ]; then
@@ -289,6 +291,108 @@ set_browser_args() {
 }
 
 stop_browser() { pkill -f -- "--user-data-dir=$PROFILE" 2>/dev/null || true; }
+
+# On macOS the browser runs under this helper, which drives it over the
+# DevTools pipe and keeps the portal's MRHSession in $SID_LIVE. Chromium only
+# writes session cookies to disk when the profile restores the last session,
+# and on macOS its tracked-preference protection resets that setting the
+# moment f5-cli changes it, so the cookie store never holds the session. The
+# helper also ends the run when the last window closes, which on macOS leaves
+# the browser itself running.
+SID_LIVE=$RUNDIR/mrhsession
+CDP_HELPER='
+import json, os, select, signal, subprocess, sys, time
+
+out, host, argv = sys.argv[1], sys.argv[2], sys.argv[3:]
+cmd_r, cmd_w = os.pipe()
+resp_r, resp_w = os.pipe()
+
+def wire():
+    a, b = os.dup(cmd_r), os.dup(resp_w)
+    os.dup2(a, 3)
+    os.dup2(b, 4)
+
+browser = subprocess.Popen(argv + ["--remote-debugging-pipe"], preexec_fn=wire,
+                           pass_fds=(3, 4), stdin=subprocess.DEVNULL)
+os.close(cmd_r)
+os.close(resp_w)
+buf, seq = b"", 0
+
+def call(method):
+    global buf, seq
+    seq += 1
+    os.write(cmd_w, json.dumps({"id": seq, "method": method}).encode() + b"\0")
+    deadline = time.time() + 5
+    while True:
+        while b"\0" in buf:
+            msg, buf = buf.split(b"\0", 1)
+            reply = json.loads(msg)
+            if reply.get("id") == seq:
+                return reply.get("result", {})
+        left = deadline - time.time()
+        if left <= 0 or not select.select([resp_r], [], [], left)[0]:
+            raise TimeoutError(method)
+        chunk = os.read(resp_r, 1 << 16)
+        if not chunk:
+            raise EOFError(method)
+        buf += chunk
+
+def publish(sid):
+    if sid is None:
+        if os.path.exists(out):
+            os.unlink(out)
+        return
+    fd = os.open(out + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, sid.encode())
+    os.close(fd)
+    os.replace(out + ".tmp", out)
+
+def stop(*_):
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+had_page = False
+try:
+    while browser.poll() is None:
+        try:
+            cookies = call("Storage.getCookies").get("cookies", [])
+            targets = call("Target.getTargets").get("targetInfos", [])
+        except TimeoutError:
+            continue
+        except (OSError, EOFError):
+            break
+        publish(next((c["value"] for c in cookies
+                      if c["name"] == "MRHSession" and c["domain"].lstrip(".") == host), None))
+        if any(t.get("type") == "page" for t in targets):
+            had_page = True
+        elif had_page:
+            break
+        time.sleep(1)
+finally:
+    if browser.poll() is None:
+        try:
+            call("Browser.close")
+            browser.wait(5)
+        except Exception:
+            browser.kill()
+'
+
+# Starts the browser on f5-cli's profile in the background, with any extra
+# arguments, logging to $1; its pid is left in BROWSER_PID.
+start_browser() {
+  local log=$1
+  shift
+  set_browser_args
+  if [ "$OS" = Darwin ]; then
+    rm -f "$SID_LIVE"
+    python3 -I -c "$CDP_HELPER" "$SID_LIVE" "$PORTAL" "$BROWSER" "${BROWSER_ARGS[@]}" "$@" \
+      >"$log" 2>&1 9>&- &
+  else
+    "$BROWSER" "${BROWSER_ARGS[@]}" "$@" >"$log" 2>&1 9>&- &
+  fi
+  BROWSER_PID=$!
+}
 
 cookie_db() {
   local f
@@ -320,7 +424,8 @@ db.commit()
 }
 
 # MRHSession is a session cookie, and Chromium only writes those to the on-disk
-# cookie store when the profile is set to restore the last session. The
+# cookie store when the profile is set to restore the last session (which
+# macOS Chromium undoes; see CDP_HELPER). The
 # protocol allowance is what the "Open f5vpn-ng?" prompt would otherwise store,
 # so the inspection can start without anyone clicking it.
 ensure_profile() {
@@ -342,21 +447,24 @@ if json.dumps(prefs, sort_keys=True) != before:
 '
 }
 
-# Cookies are "v10": AES-128-CBC with an IV of sixteen spaces, under a PBKDF2
-# key from a fixed password — "peanuts" with one round on Linux's basic store,
-# "mock_password" with 1003 on macOS's mock keychain. Recent Chromium prefixes
-# the plaintext with the sha256 of the cookie's host.
+# With --password-store=basic, cookies are "v10": AES-128-CBC under a PBKDF2
+# key derived from a fixed password, IV of sixteen spaces. Recent Chromium
+# prefixes the plaintext with the sha256 of the cookie's host. On macOS the
+# browser helper has already put the session in $SID_LIVE.
 read_sid() {
-  local tmp db ext pass rounds
+  local tmp db ext
+  if [ "$OS" = Darwin ]; then
+    [ -s "$SID_LIVE" ] && cat "$SID_LIVE"
+    return
+  fi
   db=$(cookie_db) && [ -r "$db" ] || return 1
-  if [ "$OS" = Darwin ]; then pass=mock_password rounds=1003; else pass=peanuts rounds=1; fi
   tmp=$(mktemp -d "$RUNDIR/ck.XXXXXX") || return 1
   trap 'rm -rf "$tmp"' RETURN
   cp -f "$db" "$tmp/Cookies"
   for ext in -wal -shm; do
     [ -f "$db$ext" ] && cp -f "$db$ext" "$tmp/Cookies$ext"
   done
-  F5_PORTAL="$PORTAL" CKDB="$tmp/Cookies" CK_PASS="$pass" CK_ROUNDS="$rounds" python3 -I -c '
+  F5_PORTAL="$PORTAL" CKDB="$tmp/Cookies" python3 -I -c '
 import hashlib, os, sqlite3, subprocess, sys
 host = os.environ["F5_PORTAL"]
 row = sqlite3.connect(os.environ["CKDB"]).execute(
@@ -364,8 +472,7 @@ row = sqlite3.connect(os.environ["CKDB"]).execute(
 ).fetchone()
 if row is None or row[0][:3] != b"v10":
     sys.exit(1)
-key = hashlib.pbkdf2_hmac("sha1", os.environ["CK_PASS"].encode(), b"saltysalt",
-                          int(os.environ["CK_ROUNDS"]), 16)
+key = hashlib.pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1, 16)
 pt = subprocess.run(
     ["openssl", "enc", "-d", "-aes-128-cbc", "-K", key.hex(), "-iv", "20" * 16],
     input=row[0][3:], capture_output=True, check=True,
@@ -413,10 +520,8 @@ browser_sso() {
   stop_browser
   reset_browser_state
   msg "refreshing the portal session in the background"
-  set_browser_args
-  "$BROWSER" "${BROWSER_ARGS[@]}" --headless=new --disable-gpu "https://$PORTAL/" \
-    >"$RUNDIR/browser-sso.log" 2>&1 9>&- &
-  pid=$!
+  start_browser "$RUNDIR/browser-sso.log" --headless=new --disable-gpu "https://$PORTAL/"
+  pid=$BROWSER_PID
   for i in $(seq 1 20); do
     sleep 2
     sid=$(read_sid) && [ -n "$sid" ] && break
@@ -470,9 +575,8 @@ cmd_login() {
   reset_browser_state
   msg "opening https://$PORTAL/ — sign in, and tick \"Stay signed in\" so later"
   msg "connects need no interaction. The window closes itself when you're in."
-  set_browser_args
-  "$BROWSER" "${BROWSER_ARGS[@]}" "https://$PORTAL/" >"$RUNDIR/browser.log" 2>&1 9>&- &
-  pid=$!
+  start_browser "$RUNDIR/browser.log" "https://$PORTAL/"
+  pid=$BROWSER_PID
   for i in $(seq 1 150); do
     sleep 2
     kill -0 "$pid" 2>/dev/null || break

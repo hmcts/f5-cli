@@ -118,10 +118,12 @@ same name override it. Everything is optional — see
 1. **The sign-in.** The portal hands off to Entra ID over SAML, which can't be
    scripted. f5-cli keeps a browser profile of its own; after one interactive
    sign-in, the persistent Entra cookie in it lets a headless instance of the
-   same browser complete the SAML round trip with no interaction. The profile
-   is run with a fixed cookie key — `--password-store=basic` on Linux,
-   `--use-mock-keychain` on macOS — so f5-cli can read the portal session
-   cookie back without a keyring or Keychain prompt.
+   same browser complete the SAML round trip with no interaction. On Linux
+   the profile uses a fixed cookie key (`--password-store=basic`), so f5-cli
+   reads the portal session cookie back from the profile's cookie store. On
+   macOS Chromium won't keep that session cookie on disk, so f5-cli runs the
+   browser under a small helper that asks it for the cookie over the DevTools
+   pipe instead; `--use-mock-keychain` keeps the Keychain out of it.
 2. **The endpoint inspection.** After the SAML step the portal's access policy
    waits for the native client to inspect the machine, which the browser
    normally hands over as an `f5-epi://` link. Headless browsers won't open
