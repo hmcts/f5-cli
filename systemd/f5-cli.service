@@ -1,0 +1,22 @@
+[Unit]
+Description=F5 VPN (f5-cli)
+After=network-online.target
+# Three failed connects in 15 minutes usually means the Entra sign-in has
+# lapsed, which only `f5-cli login` at the keyboard can fix.
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The user manager starts before the network is usable, so wait for the portal
+# to resolve rather than failing the first attempt.
+Environment=F5_CLI_NETWORK_WAIT=180
+ExecStart=@BIN@ up
+ExecStop=@BIN@ down
+TimeoutStartSec=420
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target

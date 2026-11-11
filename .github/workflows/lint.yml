@@ -1,0 +1,14 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck bin/f5-cli install.sh
+      - run: systemd-analyze verify --user systemd/f5-cli.service || true
