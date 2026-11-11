@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# f5-cli — connect to an F5 BIG-IP APM VPN from the terminal with the f5vpn-ng
-# client: no GUI, no webtop clicking.
+# f5-cli — connect to an F5 BIG-IP APM VPN from the terminal with the F5
+# client (f5vpn-ng on Linux, F5 VPN on macOS): no webtop clicking.
 #
 # The portal is SAML-federated to Entra ID, so the sign-in itself can't be
 # scripted. Instead f5-cli keeps a browser profile of its own: `login` opens a
@@ -10,11 +10,14 @@
 # farms out to the native client over f5-epi:// — headless Chrome won't launch
 # an external protocol, so f5-cli runs that step itself. With a live portal
 # session in hand, the launch URI is built the way the webtop's JS does and
-# handed to f5vpn-ng, which runs headless when no display is available.
+# handed to the client — headless on Linux when no display is available.
+#
+# Written for bash 3.2, so it runs on the /bin/bash macOS ships.
 set -euo pipefail
 
-VERSION=0.1.0
+VERSION=0.2.0
 CONFIG=${F5_CLI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/f5-cli/config}
+OS=$(uname -s)
 
 if [ -t 2 ]; then
   msg()  { printf '\033[1;32m[+]\033[0m %s\n' "$*" >&2; }
@@ -26,6 +29,11 @@ else
   die()  { printf '[-] %s\n' "$*" >&2; exit 1; }
 fi
 
+case $OS in
+  Linux|Darwin) ;;
+  *) die "f5-cli supports Linux and macOS, not $OS" ;;
+esac
+
 # KEY=value lines; anything already set in the environment wins.
 load_config() {
   local key value
@@ -33,7 +41,7 @@ load_config() {
   while IFS='=' read -r key value; do
     key=${key//[[:space:]]/}
     case $key in
-      F5_PORTAL|F5_RESOURCE|F5_BROWSER|F5_BROWSER_PROFILE|F5_CLIENT|F5_CLI_NETWORK_WAIT) ;;
+      F5_PORTAL|F5_RESOURCE|F5_BROWSER|F5_BROWSER_PROFILE|F5_CLIENT|F5_EPI|F5_CLI_NETWORK_WAIT) ;;
       *) continue ;;
     esac
     [ -z "${!key:-}" ] || continue
@@ -48,26 +56,61 @@ load_config
 
 PORTAL=${F5_PORTAL:-portal.platform.hmcts.net}
 RESOURCE=${F5_RESOURCE:-}
-CLIENT=${F5_CLIENT:-$(command -v f5vpn-ng || printf /usr/bin/f5vpn-ng)}
 NETWORK_WAIT=${F5_CLI_NETWORK_WAIT:-0}
 DATADIR=${XDG_DATA_HOME:-$HOME/.local/share}/f5-cli
 STATEDIR=${XDG_STATE_HOME:-$HOME/.local/state}/f5-cli
 SIDFILE=$STATEDIR/sid
-IFACE=tun0
+
+# On Linux one binary, f5vpn-ng, handles both f5-vpn:// and f5-epi://. On
+# macOS they are two apps, and both are driven through LaunchServices.
+if [ "$OS" = Darwin ]; then
+  CLIENT=${F5_CLIENT:-/Applications/F5 VPN.app}
+  EPI=${F5_EPI:-/Applications/F5 Endpoint Inspector.app}
+  CLIENT_NAME="F5 VPN"
+  CLIENT_HELP="install the macOS client (F5 VPN and F5 Endpoint Inspector) from the webtop at https://$PORTAL/"
+  CLIENT_LOGS=$HOME/Library/Logs/F5Networks/vpn.log
+else
+  CLIENT=${F5_CLIENT:-$(command -v f5vpn-ng || printf /usr/bin/f5vpn-ng)}
+  EPI=$CLIENT
+  CLIENT_NAME=f5vpn-ng
+  CLIENT_HELP="download the Linux client from https://$PORTAL/ and install it"
+  CLIENT_LOGS=$HOME/.F5Networks/f5vpn.log
+fi
 
 if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
   RUNDIR=$XDG_RUNTIME_DIR/f5-cli
+elif [ "$OS" = Darwin ] && [ -n "${TMPDIR:-}" ]; then
+  RUNDIR=${TMPDIR%/}/f5-cli
 else
   RUNDIR=/tmp/f5-cli-$(id -u)
 fi
 mkdir -p "$RUNDIR" && chmod 700 "$RUNDIR"
 [ -O "$RUNDIR" ] || die "$RUNDIR is not owned by you"
-CLIENT_LOG=$RUNDIR/f5vpn-ng.log
+CLIENT_LOG=$RUNDIR/client.log
+IFACE_FILE=$RUNDIR/iface
+
+# A macOS app bundle given as the browser means the executable inside it.
+app_binary() {
+  local name
+  if [ -d "$1" ] && [ -d "$1/Contents/MacOS" ]; then
+    name=$(basename "$1" .app)
+    [ -x "$1/Contents/MacOS/$name" ] && { printf '%s' "$1/Contents/MacOS/$name"; return 0; }
+  fi
+  printf '%s' "$1"
+}
 
 find_browser() {
-  local b
+  local b d
   if [ -n "${F5_BROWSER:-}" ]; then
-    printf '%s' "$F5_BROWSER"; return 0
+    app_binary "$F5_BROWSER"; return 0
+  fi
+  if [ "$OS" = Darwin ]; then
+    for b in "Google Chrome" Chromium "Microsoft Edge" "Brave Browser"; do
+      for d in /Applications "$HOME/Applications"; do
+        [ -x "$d/$b.app/Contents/MacOS/$b" ] && { printf '%s' "$d/$b.app/Contents/MacOS/$b"; return 0; }
+      done
+    done
+    return 1
   fi
   for b in google-chrome google-chrome-stable chromium chromium-browser \
            microsoft-edge microsoft-edge-stable brave-browser; do
@@ -79,6 +122,7 @@ find_browser() {
 # Snap-confined browsers can't reach hidden directories in $HOME, so their
 # profile has to live in the snap's own data directory instead.
 snap_name() {
+  [ "$OS" = Linux ] || return 1
   case $1 in /snap/bin/*) basename "$1"; return 0 ;; esac
   [ -f "$1" ] && [ "$(head -c 2 "$1")" = '#!' ] || return 1
   grep -o -m1 '/snap/bin/[A-Za-z0-9_-]*' "$1" | xargs -r basename
@@ -93,17 +137,137 @@ else
   PROFILE=$DATADIR/browser
 fi
 
-route_count() { ip route show 2>/dev/null | grep -c "$IFACE" || true; }
+# Whether a window can be opened: an X11/Wayland display on Linux, the
+# logged-in Aqua session on macOS (not, say, an ssh login).
+has_display() {
+  if [ "$OS" = Darwin ]; then
+    [ "$(launchctl managername 2>/dev/null)" = Aqua ]
+  else
+    [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]
+  fi
+}
+
+# timeout(1) is GNU coreutils; macOS has none unless Homebrew put one there.
+with_timeout() {
+  local secs=$1 pid watcher rc=0
+  shift
+  if command -v timeout >/dev/null; then
+    timeout "$secs" "$@" || rc=$?
+    return "$rc"
+  fi
+  "$@" & pid=$!
+  ( sleep "$secs"; kill "$pid" 2>/dev/null ) & watcher=$!
+  wait "$pid" || rc=$?
+  kill "$watcher" 2>/dev/null || true
+  pkill -P "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  return "$rc"
+}
+
+resolves() {
+  python3 -I -c 'import socket, sys; socket.getaddrinfo(sys.argv[1], 443)' "$1" >/dev/null 2>&1
+}
+
+# --- the tunnel ---------------------------------------------------------------
+#
+# On Linux svpn always brings up tun0. On macOS it takes the next free utun,
+# and macOS keeps several utuns of its own, so the one that appears during
+# `up` is remembered in $IFACE_FILE.
+
+# Tunnel-style interfaces holding an IPv4 address, one per line.
+tunnel_candidates() {
+  if [ "$OS" = Darwin ]; then
+    ifconfig 2>/dev/null | awk '
+      /^[^ \t]/ { i = $1; sub(/:$/, "", i) }
+      $1 == "inet" && i ~ /^(utun|tun|ppp)[0-9]+$/ { print i }' | sort -u
+  else
+    ip -4 -o addr show tun0 2>/dev/null | awk '{print $2}' | sort -u
+  fi
+}
+
+has_ipv4() {
+  if [ "$OS" = Darwin ]; then
+    ifconfig "$1" 2>/dev/null | awk '$1 == "inet" {f = 1} END {exit !f}'
+  else
+    ip -4 addr show "$1" 2>/dev/null | grep -q inet
+  fi
+}
+
+# The VPN's interface, if there is one. On Linux tun0 counts while it exists,
+# addressed or not, so a half-built tunnel is spotted and torn down.
+tunnel_iface() {
+  local i n
+  if [ "$OS" = Linux ]; then
+    ip link show tun0 >/dev/null 2>&1 && { printf tun0; return 0; }
+    return 1
+  fi
+  i=$(cat "$IFACE_FILE" 2>/dev/null) || i=
+  if [ -n "$i" ] && has_ipv4 "$i"; then
+    printf '%s' "$i"; return 0
+  fi
+  # Connected some other way, say from the webtop: with svpn up and a single
+  # addressed tunnel interface, that is the one.
+  pgrep -x svpn >/dev/null || return 1
+  i=$(tunnel_candidates)
+  n=$(printf '%s' "$i" | grep -c . || true)
+  [ "$n" -eq 1 ] || return 1
+  printf '%s' "$i"
+}
+
+tunnel_addr() {
+  if [ "$OS" = Darwin ]; then
+    ifconfig "$1" 2>/dev/null | awk '$1 == "inet" {print $2; exit}'
+  else
+    ip -4 -br addr show "$1" | awk '{print $3}'
+  fi
+}
+
+route_count() {
+  [ -n "${1:-}" ] || { echo 0; return 0; }
+  if [ "$OS" = Darwin ]; then
+    netstat -rn -f inet 2>/dev/null | awk -v t="$1" '$4 == t {n++} END {print n + 0}'
+  else
+    ip route show 2>/dev/null | grep -c "$1" || true
+  fi
+}
+
+# The resolvers in use: svpn rewrites /etc/resolv.conf on Linux, and on macOS
+# pushes its servers into the system configuration as the first resolver.
+dns_servers() {
+  if [ "$OS" = Darwin ]; then
+    scutil --dns 2>/dev/null | awk '
+      /^DNS configuration \(for scoped/ { exit }
+      /^resolver #/ { r++ }
+      r == 1 && /nameserver\[/ { printf " %s", $3 }'
+  else
+    awk '/^nameserver/{printf " %s", $2}' /etc/resolv.conf
+  fi
+}
 
 # svpn's route installer walks only the first ten IPv4-addressed interfaces,
 # and tun0 always has the highest ifindex, so nine other addressed interfaces
 # are enough to hide the tunnel from it: it then spins on GetBestRoute2 and
 # installs nothing at all, not even DNS. Docker bridges are the usual culprit.
-addr_count() { ip -4 -o addr show 2>/dev/null | awk -v t="$IFACE" '$2 != t' | wc -l; }
+# This is the Linux svpn's doing; nothing suggests the macOS one shares it.
+addr_count() { ip -4 -o addr show 2>/dev/null | awk '$2 != "tun0"' | wc -l; }
+
+no_routes_hint() {
+  if [ "$OS" = Linux ]; then
+    printf "svpn cannot see tun0 past %s addressed interfaces; try 'docker network prune'" "$(addr_count)"
+  else
+    printf 'see %s' "$CLIENT_LOGS"
+  fi
+}
+
+# --- the browser --------------------------------------------------------------
 
 require_client() {
-  [ -x "$CLIENT" ] \
-    || die "f5vpn-ng not found — download the Linux client from https://$PORTAL/ and install it"
+  if [ "$OS" = Darwin ]; then
+    [ -d "$CLIENT" ] || die "$CLIENT_NAME not found at $CLIENT — $CLIENT_HELP"
+    [ -d "$EPI" ] || die "F5 Endpoint Inspector not found at $EPI — $CLIENT_HELP"
+  else
+    [ -x "$CLIENT" ] || die "$CLIENT_NAME not found — $CLIENT_HELP"
+  fi
 }
 
 require_browser() {
@@ -111,9 +275,17 @@ require_browser() {
     || die "no Chromium-family browser found — install Google Chrome or Chromium, or set F5_BROWSER"
 }
 
-browser_args() {
-  printf '%s\n' "--user-data-dir=$PROFILE" --password-store=basic \
-    --no-first-run --no-default-browser-check
+# Chromium encrypts cookies under a key from the OS keyring. On Linux,
+# --password-store=basic makes that a fixed key; on macOS the key would live
+# in the login Keychain, behind a prompt, and --use-mock-keychain swaps in a
+# fixed one instead. Either way read_sid can decrypt the cookie unaided.
+set_browser_args() {
+  BROWSER_ARGS=("--user-data-dir=$PROFILE" --no-first-run --no-default-browser-check)
+  if [ "$OS" = Darwin ]; then
+    BROWSER_ARGS+=(--use-mock-keychain)
+  else
+    BROWSER_ARGS+=(--password-store=basic)
+  fi
 }
 
 stop_browser() { pkill -f -- "--user-data-dir=$PROFILE" 2>/dev/null || true; }
@@ -170,19 +342,21 @@ if json.dumps(prefs, sort_keys=True) != before:
 '
 }
 
-# With --password-store=basic, cookies are "v10": AES-128-CBC under a PBKDF2
-# key derived from a fixed password, IV of sixteen spaces. Recent Chromium
-# prefixes the plaintext with the sha256 of the cookie's host.
+# Cookies are "v10": AES-128-CBC with an IV of sixteen spaces, under a PBKDF2
+# key from a fixed password — "peanuts" with one round on Linux's basic store,
+# "mock_password" with 1003 on macOS's mock keychain. Recent Chromium prefixes
+# the plaintext with the sha256 of the cookie's host.
 read_sid() {
-  local tmp db ext
+  local tmp db ext pass rounds
   db=$(cookie_db) && [ -r "$db" ] || return 1
+  if [ "$OS" = Darwin ]; then pass=mock_password rounds=1003; else pass=peanuts rounds=1; fi
   tmp=$(mktemp -d "$RUNDIR/ck.XXXXXX") || return 1
   trap 'rm -rf "$tmp"' RETURN
   cp -f "$db" "$tmp/Cookies"
   for ext in -wal -shm; do
     [ -f "$db$ext" ] && cp -f "$db$ext" "$tmp/Cookies$ext"
   done
-  F5_PORTAL="$PORTAL" CKDB="$tmp/Cookies" python3 -I -c '
+  F5_PORTAL="$PORTAL" CKDB="$tmp/Cookies" CK_PASS="$pass" CK_ROUNDS="$rounds" python3 -I -c '
 import hashlib, os, sqlite3, subprocess, sys
 host = os.environ["F5_PORTAL"]
 row = sqlite3.connect(os.environ["CKDB"]).execute(
@@ -190,7 +364,8 @@ row = sqlite3.connect(os.environ["CKDB"]).execute(
 ).fetchone()
 if row is None or row[0][:3] != b"v10":
     sys.exit(1)
-key = hashlib.pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1, 16)
+key = hashlib.pbkdf2_hmac("sha1", os.environ["CK_PASS"].encode(), b"saltysalt",
+                          int(os.environ["CK_ROUNDS"]), 16)
 pt = subprocess.run(
     ["openssl", "enc", "-d", "-aes-128-cbc", "-K", key.hex(), "-iv", "20" * 16],
     input=row[0][3:], capture_output=True, check=True,
@@ -216,25 +391,30 @@ save_sid() { mkdir -p "$STATEDIR"; chmod 700 "$STATEDIR"; (umask 077; printf '%s
 
 # The endpoint inspection the access policy waits for: machine info plus two
 # OESIS passes, posted back to /my.policy_host, after which the policy lets the
-# session through to the webtop.
+# session through to the webtop. On macOS the inspector is its own app, which
+# quits once it has posted; `open -W` waits for that.
 run_epc() {
-  timeout 120 env -u DISPLAY -u WAYLAND_DISPLAY -u GDK_BACKEND "$CLIENT" \
-    "f5-epi://$PORTAL?server=$PORTAL&protocol=https&port=443&sid=$1" \
-    >"$RUNDIR/epc.log" 2>&1 9>&- || true
+  local uri="f5-epi://$PORTAL?server=$PORTAL&protocol=https&port=443&sid=$1"
+  if [ "$OS" = Darwin ]; then
+    with_timeout 120 open -W -g -a "$EPI" "$uri" >"$RUNDIR/epc.log" 2>&1 9>&- || true
+  else
+    timeout 120 env -u DISPLAY -u WAYLAND_DISPLAY -u GDK_BACKEND "$CLIENT" "$uri" \
+      >"$RUNDIR/epc.log" 2>&1 9>&- || true
+  fi
 }
 
 # No window and no interaction: the profile's persistent Entra cookie carries
 # the SAML round trip, and the inspection is run here rather than by the
 # browser, which cannot launch an external protocol while headless.
 browser_sso() {
-  local pid sid i args
+  local pid sid i
   require_browser
   ensure_profile
   stop_browser
   reset_browser_state
   msg "refreshing the portal session in the background"
-  mapfile -t args < <(browser_args)
-  "$BROWSER" "${args[@]}" --headless=new --disable-gpu "https://$PORTAL/" \
+  set_browser_args
+  "$BROWSER" "${BROWSER_ARGS[@]}" --headless=new --disable-gpu "https://$PORTAL/" \
     >"$RUNDIR/browser-sso.log" 2>&1 9>&- &
   pid=$!
   for i in $(seq 1 20); do
@@ -274,24 +454,24 @@ get_live_sid() {
 
   browser_sso && { cat "$SIDFILE"; return 0; }
 
-  [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 1
+  has_display || return 1
   warn "the Entra sign-in has lapsed — opening a browser window"
   cmd_login || return 1
   cat "$SIDFILE"
 }
 
 cmd_login() {
-  local pid sid i args db epc_done=0
+  local pid sid i db epc_done=0
   require_browser
   require_client
-  [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || die "login needs a graphical session to open a browser window"
+  has_display || die "login needs a graphical session to open a browser window"
   ensure_profile
   stop_browser
   reset_browser_state
   msg "opening https://$PORTAL/ — sign in, and tick \"Stay signed in\" so later"
   msg "connects need no interaction. The window closes itself when you're in."
-  mapfile -t args < <(browser_args)
-  "$BROWSER" "${args[@]}" "https://$PORTAL/" >"$RUNDIR/browser.log" 2>&1 9>&- &
+  set_browser_args
+  "$BROWSER" "${BROWSER_ARGS[@]}" "https://$PORTAL/" >"$RUNDIR/browser.log" 2>&1 9>&- &
   pid=$!
   for i in $(seq 1 150); do
     sleep 2
@@ -339,18 +519,30 @@ build_launch_uri() {
   local sid=$1 resource=$2 otc link
   otc=$(curl -s -D - -o /dev/null --max-time 15 -H "Cookie: MRHSession=$sid" \
         "https://$PORTAL/vdesk/get_token_for_sessid.php3" \
-        | awk 'BEGIN{IGNORECASE=1} /^X-ACCESS-Session-Token:/ {gsub(/\r/,"");print $2; exit}')
+        | awk 'tolower($1) == "x-access-session-token:" {gsub(/\r/, ""); print $2; exit}')
   [ -n "$otc" ] || return 1
   link="f5-vpn://$PORTAL?server=$PORTAL&resourcename=$resource"
   link+="&resourcetype=network_access&cmd=launch&protocol=https&port=443"
   link+="&sid=nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"
-  printf '%s&token=%s&otc=%s' "$link" "$(printf '%s' "$link" | md5sum | cut -d' ' -f1)" "$otc"
+  printf '%s&token=%s&otc=%s' "$link" "$(printf '%s' "$link" | openssl dgst -md5 | awk '{print $NF}')" "$otc"
+}
+
+# Headless on Linux when there is no display. On macOS the client has no
+# headless mode, so its window opens in the background.
+launch_client() {
+  if [ "$OS" = Darwin ]; then
+    open -g --stdout "$CLIENT_LOG" --stderr "$CLIENT_LOG" -a "$CLIENT" "$1" 9>&-
+  else
+    setsid env -u DISPLAY -u WAYLAND_DISPLAY -u GDK_BACKEND \
+      "$CLIENT" "$1" </dev/null >"$CLIENT_LOG" 2>&1 9>&- &
+    disown || true
+  fi
 }
 
 wait_for_network() {
   local i
   for i in $(seq 0 "$NETWORK_WAIT"); do
-    getent hosts "$PORTAL" >/dev/null 2>&1 && return 0
+    resolves "$PORTAL" && return 0
     [ "$i" -lt "$NETWORK_WAIT" ] && sleep 1
   done
   die "cannot resolve $PORTAL — is the network up?"
@@ -359,8 +551,10 @@ wait_for_network() {
 # svpn rewrites /etc/resolv.conf in place and hands back a copy of resolved's
 # stub on the way out, leaving a plain file where the symlink was. If svpn is
 # killed instead (a shutdown, a crash) it never hands anything back, and the
-# VPN's nameservers, unreachable without the tunnel, outlive it.
+# VPN's nameservers, unreachable without the tunnel, outlive it. macOS keeps
+# its resolvers in the system configuration instead, so this is Linux only.
 restore_resolv_conf() {
+  [ "$OS" = Linux ] || return 0
   [ -L /etc/resolv.conf ] && return 0
   if grep -q 'F5 Networks' /etc/resolv.conf 2>/dev/null; then
     pgrep -x svpn >/dev/null && return 0
@@ -374,22 +568,35 @@ restore_resolv_conf() {
     || warn "/etc/resolv.conf was left by svpn; relink it with: sudo ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf"
 }
 
+# The interface that came up since `before` was taken.
+new_tunnel() {
+  local i
+  for i in $(tunnel_candidates); do
+    printf '%s\n' "$1" | grep -qx "$i" && continue
+    printf '%s' "$i"; return 0
+  done
+  return 1
+}
+
 cmd_up() {
-  local sid resource uri others i
+  local sid resource uri others i iface before
   require_client
-  if [ "$(route_count)" -gt 5 ]; then
-    msg "already connected ($(route_count) routes on $IFACE)"; return 0
+  iface=$(tunnel_iface) || iface=
+  if [ -n "$iface" ] && [ "$(route_count "$iface")" -gt 5 ]; then
+    msg "already connected ($(route_count "$iface") routes on $iface)"; return 0
   fi
-  if ip link show "$IFACE" >/dev/null 2>&1; then
-    warn "stale $IFACE with $(route_count) route(s) — tearing down first"
+  if [ -n "$iface" ] || { [ "$OS" = Darwin ] && pgrep -x svpn >/dev/null; }; then
+    warn "stale tunnel${iface:+ on $iface} with $(route_count "$iface") route(s) — tearing down first"
     cmd_down || true
   fi
   restore_resolv_conf
   wait_for_network
 
-  others=$(addr_count)
-  if [ "$others" -ge 8 ]; then
-    warn "$others interfaces hold an IPv4 address — svpn reads ten and $IFACE comes last; 'docker network prune' buys room"
+  if [ "$OS" = Linux ]; then
+    others=$(addr_count)
+    if [ "$others" -ge 8 ]; then
+      warn "$others interfaces hold an IPv4 address — svpn reads ten and tun0 comes last; 'docker network prune' buys room"
+    fi
   fi
 
   sid=$(get_live_sid) || die "no portal session — run 'f5-cli login'"
@@ -401,56 +608,63 @@ cmd_up() {
   fi
   uri=$(build_launch_uri "$sid" "$resource") || die "portal would not issue a one-time code"
 
-  msg "starting f5vpn-ng ($resource)"
-  setsid env -u DISPLAY -u WAYLAND_DISPLAY -u GDK_BACKEND \
-    "$CLIENT" "$uri" </dev/null >"$CLIENT_LOG" 2>&1 9>&- &
-  disown || true
+  msg "starting $CLIENT_NAME ($resource)"
+  before=$(tunnel_candidates)
+  rm -f "$IFACE_FILE"
+  launch_client "$uri"
 
+  iface=
   for i in $(seq 1 60); do
-    ip -4 addr show "$IFACE" 2>/dev/null | grep -q inet && break
+    iface=$(new_tunnel "$before") && break
+    iface=
     sleep 1
   done
-  ip -4 addr show "$IFACE" 2>/dev/null | grep -q inet \
-    || die "$IFACE never came up — see $CLIENT_LOG and ~/.F5Networks/f5vpn.log"
-  msg "$IFACE up: $(ip -4 -br addr show "$IFACE" | awk '{print $3}')"
+  if [ -z "$iface" ]; then
+    [ "$OS" = Darwin ] && warn "if $CLIENT_NAME is showing a dialog (an update offer, say), answer it and run 'f5-cli up' again"
+    die "the tunnel never came up — see $CLIENT_LOG and $CLIENT_LOGS"
+  fi
+  printf '%s\n' "$iface" >"$IFACE_FILE"
+  msg "$iface up: $(tunnel_addr "$iface")"
 
   for i in $(seq 1 30); do
-    [ "$(route_count)" -gt 5 ] && break
+    [ "$(route_count "$iface")" -gt 5 ] && break
     sleep 1
   done
-  [ "$(route_count)" -gt 5 ] \
-    || die "no routes on $IFACE — svpn cannot see it past $(addr_count) addressed interfaces; try 'docker network prune'"
-  msg "connected: $(route_count) routes, DNS via$(awk '/^nameserver/{printf " %s", $2}' /etc/resolv.conf)"
+  [ "$(route_count "$iface")" -gt 5 ] || die "no routes on $iface — $(no_routes_hint)"
+  msg "connected: $(route_count "$iface") routes, DNS via$(dns_servers)"
 }
 
 # Stopping the client is enough: it tells svpn to disconnect, and svpn takes
 # the tunnel down and exits a few seconds later.
 cmd_down() {
   local i
-  pkill -x f5vpn-ng 2>/dev/null || true
+  pkill -x "$CLIENT_NAME" 2>/dev/null || true
   for i in $(seq 1 15); do
     pgrep -x svpn >/dev/null || break
     sleep 1
   done
   if pgrep -x svpn >/dev/null; then
-    sudo -n pkill -x svpn 2>/dev/null || warn "svpn is still running — stop it with: sudo pkill -x svpn"
+    # macOS's svpn is setuid root but runs as you, so you may signal it.
+    pkill -x svpn 2>/dev/null || sudo -n pkill -x svpn 2>/dev/null \
+      || warn "svpn is still running — stop it with: sudo pkill -x svpn"
   fi
+  rm -f "$IFACE_FILE"
   restore_resolv_conf
   msg "disconnected"
 }
 
 cmd_status() {
-  local n
-  if ! ip link show "$IFACE" >/dev/null 2>&1; then
-    echo "$IFACE: absent — not connected"
-    grep -q 'F5 Networks' /etc/resolv.conf 2>/dev/null && ! pgrep -x svpn >/dev/null \
+  local n iface
+  if ! iface=$(tunnel_iface); then
+    echo "tunnel: absent — not connected"
+    [ "$OS" = Linux ] && grep -q 'F5 Networks' /etc/resolv.conf 2>/dev/null && ! pgrep -x svpn >/dev/null \
       && warn "/etc/resolv.conf still points at the VPN's DNS — 'f5-cli down' restores it"
     return 1
   fi
-  n=$(route_count)
-  echo "$IFACE: $(ip -4 -br addr show "$IFACE" | awk '{print $3}')   routes: $n"
-  echo "dns:$(awk '/^nameserver/{printf " %s", $2}' /etc/resolv.conf)"
-  [ "$n" -gt 5 ] || { warn "only $n route(s) — svpn cannot see $IFACE past $(addr_count) addressed interfaces"; return 1; }
+  n=$(route_count "$iface")
+  echo "$iface: $(tunnel_addr "$iface")   routes: $n"
+  echo "dns:$(dns_servers)"
+  [ "$n" -gt 5 ] || { warn "only $n route(s) — $(no_routes_hint)"; return 1; }
 }
 
 cmd_session() {
@@ -458,14 +672,28 @@ cmd_session() {
   msg "portal session is live"
 }
 
-# A second f5vpn-ng hands its URI to the running one, which drops the session
+# A second client hands its URI to the running one, which drops the session
 # it was bringing up, so commands that start or stop the client take turns.
 # Children are started with fd 9 closed so the client can't keep the lock.
+#
+# macOS has no flock(1). An flock(2) lock belongs to the open file, which
+# python3 shares with this shell as fd 9, so the lock it takes outlives it.
+lock() {
+  if command -v flock >/dev/null; then
+    flock "$@" 9
+  else
+    python3 -I -c '
+import fcntl, sys
+fcntl.flock(9, fcntl.LOCK_EX | (fcntl.LOCK_NB if "-n" in sys.argv[1:] else 0))
+' "$@" 2>/dev/null
+  fi
+}
+
 take_lock() {
   exec 9>"$RUNDIR/lock"
-  flock -n 9 && return 0
+  lock -n && return 0
   msg "another f5-cli is running — waiting for it to finish"
-  flock 9
+  lock
 }
 
 usage() {

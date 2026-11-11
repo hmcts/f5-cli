@@ -12,3 +12,12 @@ jobs:
       - uses: actions/checkout@v4
       - run: shellcheck bin/f5-cli install.sh
       - run: systemd-analyze verify --user systemd/f5-cli.service || true
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # /bin/bash is 3.2 on macOS; the script must parse and run under it.
+      - run: /bin/bash -n bin/f5-cli && /bin/bash -n install.sh
+      - run: /bin/bash bin/f5-cli version && /bin/bash bin/f5-cli help
+      - run: plutil -lint launchd/f5-cli.plist
