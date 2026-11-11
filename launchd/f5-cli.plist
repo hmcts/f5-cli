@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  f5-cli LaunchAgent for macOS: connects the VPN when you log in. install.sh
+  fills in @LABEL@, @BIN@ and @LOG@ and writes it to ~/Library/LaunchAgents.
+
+  launchd has no equivalent of systemd's StartLimitBurst, so the three tries a
+  minute apart live in the command itself. Three failures usually mean the
+  Entra sign-in has lapsed, which only `f5-cli login` at the keyboard can fix.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>@LABEL@</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>for i in 1 2 3; do "$0" up &amp;&amp; exit 0; [ "$i" = 3 ] || sleep 60; done; exit 1</string>
+    <string>@BIN@</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- The network may not be usable yet at login, so wait for the portal
+         to resolve rather than failing the first attempt. -->
+    <key>F5_CLI_NETWORK_WAIT</key>
+    <string>180</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>@LOG@</string>
+  <key>StandardErrorPath</key>
+  <string>@LOG@</string>
+</dict>
+</plist>

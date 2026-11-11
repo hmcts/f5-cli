@@ -9,11 +9,17 @@ F5_PORTAL=portal.platform.hmcts.net
 #F5_RESOURCE=/Common/netacl_mojvpn
 
 # A Chromium-family browser for the sign-in. Found on PATH when unset
-# (google-chrome, chromium, microsoft-edge, brave-browser).
+# (google-chrome, chromium, microsoft-edge, brave-browser); on macOS, looked
+# for in /Applications and ~/Applications. A .app bundle path is fine.
 #F5_BROWSER=/usr/bin/google-chrome
+#F5_BROWSER=/Applications/Google Chrome.app
 
 # Where f5-cli keeps its own browser profile.
 #F5_BROWSER_PROFILE=~/.local/share/f5-cli/browser
 
-# The F5 client binary.
+# The F5 client: the f5vpn-ng binary on Linux, the F5 VPN app on macOS.
 #F5_CLIENT=/usr/bin/f5vpn-ng
+#F5_CLIENT=/Applications/F5 VPN.app
+
+# macOS only: the endpoint inspector, a separate app there.
+#F5_EPI=/Applications/F5 Endpoint Inspector.app
