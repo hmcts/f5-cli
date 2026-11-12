@@ -41,7 +41,7 @@ load_config() {
   while IFS='=' read -r key value; do
     key=${key//[[:space:]]/}
     case $key in
-      F5_PORTAL|F5_RESOURCE|F5_BROWSER|F5_BROWSER_PROFILE|F5_CLIENT|F5_EPI|F5_CLI_NETWORK_WAIT|F5_BRIDGE_SYNC_DNS) ;;
+      F5_PORTAL|F5_RESOURCE|F5_BROWSER|F5_BROWSER_PROFILE|F5_CLIENT|F5_EPI|F5_CLI_NETWORK_WAIT) ;;
       *) continue ;;
     esac
     [ -z "${!key:-}" ] || continue
@@ -60,6 +60,8 @@ NETWORK_WAIT=${F5_CLI_NETWORK_WAIT:-0}
 DATADIR=${XDG_DATA_HOME:-$HOME/.local/share}/f5-cli
 STATEDIR=${XDG_STATE_HOME:-$HOME/.local/state}/f5-cli
 SIDFILE=$STATEDIR/sid
+# F5_RESOLV_CONF is for the tests.
+RESOLV_CONF=${F5_RESOLV_CONF:-/etc/resolv.conf}
 
 # On Linux one binary, f5vpn-ng, handles both f5-vpn:// and f5-epi://. On
 # macOS they are two apps, and both are driven through LaunchServices.
@@ -243,9 +245,15 @@ dns_servers() {
       f && /}/ { exit }
       f { printf " %s", $3 }'
   else
-    awk '/^nameserver/{printf " %s", $2}' /etc/resolv.conf
+    nameservers "$RESOLV_CONF"
   fi
 }
+
+# The nameserver lines of a resolv.conf, on one line, from $1 or stdin.
+nameservers() { awk '$1 == "nameserver" {printf " %s", $2}' "$@"; }
+
+# svpn marks the resolv.conf it writes; the stub it hands back is unmarked.
+svpn_dns() { grep -q 'F5 Networks' "$RESOLV_CONF" 2>/dev/null; }
 
 # svpn's route installer walks only the first ten IPv4-addressed interfaces,
 # and tun0 always has the highest ifindex, so nine other addressed interfaces
@@ -658,19 +666,20 @@ wait_for_network() {
 # killed instead (a shutdown, a crash) it never hands anything back, and the
 # VPN's nameservers, unreachable without the tunnel, outlive it. macOS keeps
 # its resolvers in the system configuration instead, so this is Linux only.
+# The link's relative target is the one for /etc/resolv.conf itself.
 restore_resolv_conf() {
   [ "$OS" = Linux ] || return 0
-  [ -L /etc/resolv.conf ] && return 0
-  if grep -q 'F5 Networks' /etc/resolv.conf 2>/dev/null; then
+  [ -L "$RESOLV_CONF" ] && return 0
+  if svpn_dns; then
     pgrep -x svpn >/dev/null && return 0
-    warn "/etc/resolv.conf still points at the VPN's DNS but svpn is not running — restoring it"
-  elif ! grep -q stub-resolv.conf /etc/resolv.conf 2>/dev/null; then
+    warn "$RESOLV_CONF still points at the VPN's DNS but svpn is not running — restoring it"
+  elif ! grep -q stub-resolv.conf "$RESOLV_CONF" 2>/dev/null; then
     return 0
   fi
   [ -e /run/systemd/resolve/stub-resolv.conf ] \
-    || { warn "/etc/resolv.conf was left by svpn and systemd-resolved is not running — fix it by hand"; return 0; }
-  sudo -n ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null \
-    || warn "/etc/resolv.conf was left by svpn; relink it with: sudo ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf"
+    || { warn "$RESOLV_CONF was left by svpn and systemd-resolved is not running — fix it by hand"; return 0; }
+  sudo -n ln -sf ../run/systemd/resolve/stub-resolv.conf "$RESOLV_CONF" 2>/dev/null \
+    || warn "$RESOLV_CONF was left by svpn; relink it with: sudo ln -sf ../run/systemd/resolve/stub-resolv.conf $RESOLV_CONF"
 }
 
 # The interface that came up since `before` was taken.
@@ -747,6 +756,13 @@ cmd_up() {
       sleep 1
     done
     [ -n "$(dns_servers)" ] || warn "svpn has not set the VPN's DNS yet — internal names may not resolve"
+  else
+    # Linux's svpn rewrites resolv.conf only after the routes are in.
+    for i in $(seq 1 15); do
+      svpn_dns && break
+      sleep 1
+    done
+    svpn_dns || warn "svpn has not set the VPN's DNS yet — internal names may not resolve"
   fi
   msg "connected: $(route_count "$iface") routes, DNS via$(dns_servers)"
 }
@@ -764,6 +780,11 @@ cmd_down() {
     # macOS's svpn is setuid root but runs as you, so you may signal it.
     pkill -x svpn 2>/dev/null || sudo -n pkill -x svpn 2>/dev/null \
       || warn "svpn is still running — stop it with: sudo pkill -x svpn"
+    # Until it has gone, restore_resolv_conf takes its DNS for a live tunnel's.
+    for i in $(seq 1 5); do
+      pgrep -x svpn >/dev/null || break
+      sleep 1
+    done
   fi
   rm -f "$IFACE_FILE"
   restore_resolv_conf
@@ -774,8 +795,8 @@ cmd_status() {
   local n iface
   if ! iface=$(tunnel_iface); then
     echo "tunnel: absent — not connected"
-    [ "$OS" = Linux ] && grep -q 'F5 Networks' /etc/resolv.conf 2>/dev/null && ! pgrep -x svpn >/dev/null \
-      && warn "/etc/resolv.conf still points at the VPN's DNS — 'f5-cli down' restores it"
+    [ "$OS" = Linux ] && svpn_dns && ! pgrep -x svpn >/dev/null \
+      && warn "$RESOLV_CONF still points at the VPN's DNS — 'f5-cli down' restores it"
     return 1
   fi
   n=$(route_count "$iface")
@@ -869,17 +890,22 @@ cmd_bridge_status() {
 # hears of it. `dns` prints the host's resolver lines so a container can copy
 # them. On macOS svpn leaves /etc/resolv.conf alone and uses split DNS, which
 # Docker Desktop's own resolver already follows, so there is nothing to copy.
-# F5_RESOLV_CONF is for the tests.
-RESOLV_CONF=${F5_RESOLV_CONF:-/etc/resolv.conf}
-
 resolv_lines() { grep -E '^[[:space:]]*(nameserver|search|domain|options)([[:space:]]|$)' || true; }
 
-cmd_dns() {
-  case ${1:-} in
-    '') ;;
-    --apply) die "'dns --apply' copies the host's DNS into a container; on the host there is nothing to do" ;;
-    *) usage >&2; exit 2 ;;
+# `dns [--apply]`, on either side; sets DNS_APPLY.
+parse_dns_args() {
+  DNS_APPLY=0
+  case $#:${1:-} in
+    0:) return 0 ;;
+    1:--apply) DNS_APPLY=1; return 0 ;;
   esac
+  usage >&2
+  exit 2
+}
+
+cmd_dns() {
+  [ "$DNS_APPLY" = 0 ] \
+    || die "'dns --apply' copies the host's DNS into a container; on the host there is nothing to do"
   [ "$OS" = Darwin ] && return 0
   [ -r "$RESOLV_CONF" ] || die "cannot read $RESOLV_CONF"
   resolv_lines <"$RESOLV_CONF"
@@ -911,13 +937,17 @@ dns_apply() {
     msg "the host has no DNS for a container to copy — $RESOLV_CONF left alone"
     return 0
   fi
+  if [ -z "$(printf '%s\n' "$lines" | nameservers)" ]; then
+    warn "the host's DNS has no nameserver — $RESOLV_CONF left alone"
+    return 1
+  fi
   if [ "$(cat "$RESOLV_CONF" 2>/dev/null)" = "$lines" ]; then
     msg "$RESOLV_CONF already has the host's DNS"
     return 0
   fi
   if { printf '%s\n' "$lines" >"$RESOLV_CONF"; } 2>/dev/null \
     || printf '%s\n' "$lines" | sudo -n tee "$RESOLV_CONF" >/dev/null 2>&1; then
-    msg "copied the host's DNS to $RESOLV_CONF:$(printf '%s\n' "$lines" | awk '$1 == "nameserver" {printf " %s", $2}')"
+    msg "copied the host's DNS to $RESOLV_CONF:$(printf '%s\n' "$lines" | nameservers)"
     return 0
   fi
   warn "could not write $RESOLV_CONF — run as root, or with sudo that needs no password"
@@ -1085,11 +1115,9 @@ if in_container; then
       exit "$rc"
       ;;
     dns)
-      case ${2:-} in
-        '')      bridge_dns; exit ;;
-        --apply) dns_apply; exit ;;
-        *)       usage >&2; exit 2 ;;
-      esac
+      parse_dns_args "${@:2}"
+      if [ "$DNS_APPLY" = 1 ]; then dns_apply; else bridge_dns; fi
+      exit
       ;;
     bridge)
       [ "${2:-}" = status ] || die "in a container, only 'f5-cli bridge status' — the bridge itself runs on the host"
@@ -1105,7 +1133,7 @@ case "${1:-help}" in
   login)               take_lock; cmd_login ;;
   session)             take_lock; cmd_session ;;
   version|--version)   echo "f5-cli $VERSION" ;;
-  dns)                 cmd_dns "${2:-}" ;;
+  dns)                 parse_dns_args "${@:2}"; cmd_dns ;;
   bridge)
     case "${2:-}" in
       serve)  cmd_bridge_serve ;;

@@ -150,10 +150,17 @@ fail there even with the tunnel up. `f5-cli dns` prints the host's
 `nameserver`, `search`, `domain` and `options` lines, and in the container
 `f5-cli dns --apply` writes them to its `/etc/resolv.conf` — in place, since
 Docker bind-mounts that file — as root or with `sudo` that needs no password.
-Set `F5_BRIDGE_SYNC_DNS=1` in the container to do that after every `up` and
-`down`; `up` exits 0 when already connected, so it also repairs stale DNS. It
-is off by default because copying the host's DNS only makes sense with
-`--network=host`. A macOS host has nothing to copy — Docker Desktop resolves
+Set `F5_BRIDGE_SYNC_DNS=1` in the container's environment to do that after
+every `up` and `down`; `up` exits 0 when already connected, so it also repairs
+stale DNS. It is off by default because copying the host's DNS only makes
+sense with `--network=host`, and f5-cli ignores it in the config file, which
+every container with the mount shares. In a devcontainer:
+
+```jsonc
+"containerEnv": { "F5_BRIDGE_SYNC_DNS": "1" }
+```
+
+A macOS host has nothing to copy — Docker Desktop resolves
 through the host itself — so there `dns` prints nothing and `--apply` leaves
 the file alone.
 
@@ -180,7 +187,7 @@ same name override it. Everything is optional — see
 | `F5_EPI` | macOS only: `/Applications/F5 Endpoint Inspector.app` |
 | `F5_BRIDGE_HOST` | in a container: `host.docker.internal` if it resolves, else `127.0.0.1` |
 | `F5_BRIDGE_FILE` | `~/.config/f5-cli/bridge` — the bridge's port and token |
-| `F5_BRIDGE_SYNC_DNS` | `0` — in a container, `1` copies the host's DNS after `up` and `down` |
+| `F5_BRIDGE_SYNC_DNS` | `0` — in a container, `1` copies the host's DNS after `up` and `down`; environment only |
 | `F5_CLI_NETWORK_WAIT` | `0` — seconds `up` waits for the portal to resolve |
 
 ## How it works

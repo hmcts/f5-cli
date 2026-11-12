@@ -6,7 +6,7 @@
 # F5_IN_CONTAINER picks the side, so it runs the same on a laptop, in a container and in CI.
 # The server runs the real f5-cli, but only commands that change nothing: `status` and
 # `version` (with no VPN up, `status` reports no tunnel and exits 1 on every machine), `dns`
-# on a fake resolv.conf, and, on Linux, `up` against a faked tunnel that is already there.
+# on a fake resolv.conf, and, on Linux, `up` against a faked client, tunnel and portal.
 # On Linux it also runs `install.sh --bridge` with systemctl faked. Needs python3 and curl. Written for
 # bash 3.2, like f5-cli.
 
@@ -49,10 +49,11 @@ wait_for() {
 }
 
 # container <bridge-file> args... — f5-cli on the container side, with nothing of the host's.
+# TEST_CONFIG gives it a config file.
 container() {
   local file=$1
   shift
-  env HOME="$T/home" F5_CLI_CONFIG=/dev/null F5_IN_CONTAINER=1 F5_BRIDGE_FILE="$file" \
+  env HOME="$T/home" F5_CLI_CONFIG="${TEST_CONFIG:-/dev/null}" F5_IN_CONTAINER=1 F5_BRIDGE_FILE="$file" \
     F5_BRIDGE_HOST=127.0.0.1 /bin/bash "$F5" "$@" >"$T/out" 2>&1
 }
 
@@ -180,38 +181,104 @@ EOF
   rc=$?
   [ "$rc" -eq 1 ] && grep -q 'could not write' "$T/out" && ok "$CASE exits 1" || no "expected exit 1"
 
-  # A second bridge, on a host whose tunnel is faked up: its `up` finds it
-  # connected and exits 0, touching nothing.
-  mkdir -p "$T/upbin" "$T/run"
-  cat >"$T/upbin/ip" <<'EOF'
+  CASE="dns with extra arguments"
+  F5_RESOLV_CONF="$T/target" container "$T/bridge" dns --apply extra
+  rc=$?
+  env HOME="$T/home" F5_CLI_CONFIG=/dev/null F5_IN_CONTAINER=0 /bin/bash "$F5" dns --apply extra >/dev/null 2>&1
+  rc2=$?
+  [ "$rc" -eq 2 ] && [ "$rc2" -eq 2 ] && ok "$CASE shows usage on both sides" || no "expected exit 2 on both sides"
+
+  # A second bridge, on a host where `up` runs to the end against fakes: an `ip`
+  # that shows tun0 with ten routes once the fake client has made $T/tun0, a
+  # portal that answers every question, and a client that writes svpn's
+  # resolv.conf two seconds later, unless $T/no-dns says not to.
+  mkdir -p "$T/upbin" "$T/run" "$T/home/.local/state/f5-cli"
+  printf 'fake-session-id\n' >"$T/home/.local/state/f5-cli/sid"
+  cat >"$T/upbin/ip" <<EOF
+#!/bin/sh
+case "\$*" in
+  *tun0*) [ -f "$T/tun0" ] || exit 1 ;;
+esac
+case "\$*" in
+  "-4 -o addr show tun0") echo "9: tun0    inet 10.9.9.9/32 scope global tun0" ;;
+  "-4 -br addr show tun0") echo "tun0 UNKNOWN 10.9.9.9/32" ;;
+  "route show") [ -f "$T/tun0" ] && for n in 1 2 3 4 5 6 7 8 9 10; do echo "10.\$n.0.0/16 dev tun0"; done ;;
+esac
+exit 0
+EOF
+  cat >"$T/upbin/curl" <<'EOF'
 #!/bin/sh
 case "$*" in
-  "link show tun0") exit 0 ;;
-  "route show") for n in 1 2 3 4 5 6 7 8 9 10; do echo "10.$n.0.0/16 dev tun0"; done ;;
+  *http_code*) printf 200 ;;
+  *" -D "*) printf 'x-access-session-token: fake-otc\r\n' ;;
 esac
 EOF
-  printf '#!/bin/sh\nexit 0\n' >"$T/upbin/f5vpn-ng"
-  chmod +x "$T/upbin/ip" "$T/upbin/f5vpn-ng"
+  cat >"$T/upbin/f5vpn-ng" <<EOF
+#!/bin/sh
+touch "$T/tun0"
+[ -f "$T/no-dns" ] || { sleep 2; cp "$T/vpn-resolv" "$T/up-resolv"; } </dev/null >/dev/null 2>&1 &
+EOF
+  chmod +x "$T/upbin/ip" "$T/upbin/curl" "$T/upbin/f5vpn-ng"
+  cat >"$T/vpn-resolv" <<'EOF'
+#F5 Networks Inc. :File modified by VPN process
+nameserver 10.11.75.4
+nameserver 168.63.129.16
+search platform.hmcts.net
+EOF
+  grep -E '^(nameserver|search)' "$T/vpn-resolv" >"$T/vpn-expected"
   UPORT=$(free_port)
   printf 'PORT=%s\nTOKEN=%s\n' "$UPORT" right-token >"$T/bridge-up"
   env HOME="$T/home" F5_CLI_CONFIG=/dev/null F5_IN_CONTAINER=0 F5_BRIDGE_FILE="$T/bridge-up" \
-    F5_RESOLV_CONF="$T/host-resolv" F5_CLIENT="$T/upbin/f5vpn-ng" XDG_RUNTIME_DIR="$T/run" PATH="$T/upbin:$PATH" \
+    F5_RESOLV_CONF="$T/up-resolv" F5_CLIENT="$T/upbin/f5vpn-ng" F5_PORTAL=localhost F5_RESOURCE=/Common/fake \
+    XDG_RUNTIME_DIR="$T/run" XDG_STATE_HOME="$T/home/.local/state" PATH="$T/upbin:$PATH" \
     /bin/bash "$F5" bridge serve 2>"$T/server-up.log" &
   SERVERS="$SERVERS $!"
   wait_for "$UPORT" || { echo "the second bridge never started:"; cat "$T/server-up.log"; exit 1; }
+  # connected <yes|no>: tun0 there and svpn's DNS in place, or neither.
+  connected() {
+    rm -f "$T/tun0" "$T/no-dns"
+    printf '%s\n' "$STUB" >"$T/up-resolv"
+    [ "$1" = yes ] || return 0
+    touch "$T/tun0"
+    cp "$T/vpn-resolv" "$T/up-resolv"
+  }
 
-  CASE="up with F5_BRIDGE_SYNC_DNS=1"
+  CASE="up"
+  connected no
   reset_target
   F5_BRIDGE_SYNC_DNS=1 F5_RESOLV_CONF="$T/target" container "$T/bridge-up" up
   rc=$?
-  [ "$rc" -eq 0 ] && grep -q 'already connected' "$T/out" && cmp -s "$T/target-link" "$T/expected" \
-    && ok "$CASE copies the host's DNS afterwards" || no "expected exit 0 and the target synced"
+  [ "$rc" -eq 0 ] && grep -q 'connected: 10 routes, DNS via 10.11.75.4 168.63.129.16' "$T/out" \
+    && cmp -s "$T/target-link" "$T/vpn-expected" \
+    && ok "$CASE waits for svpn's resolv.conf, and the sync copies the VPN's DNS" || no "expected the VPN's DNS"
+
+  CASE="up, svpn never sets DNS"
+  connected no
+  touch "$T/no-dns"
+  F5_RESOLV_CONF="$T/target" container "$T/bridge-up" up
+  rc=$?
+  [ "$rc" -eq 0 ] && grep -q 'has not set the VPN' "$T/out" && ok "$CASE warns" || no "expected exit 0 and a warning"
+
+  CASE="up with F5_BRIDGE_SYNC_DNS=1"
+  connected yes
+  reset_target
+  F5_BRIDGE_SYNC_DNS=1 F5_RESOLV_CONF="$T/target" container "$T/bridge-up" up
+  rc=$?
+  [ "$rc" -eq 0 ] && grep -q 'already connected' "$T/out" && cmp -s "$T/target-link" "$T/vpn-expected" \
+    && ok "$CASE, already connected, copies the host's DNS afterwards" || no "expected exit 0 and the target synced"
 
   CASE="up without F5_BRIDGE_SYNC_DNS"
   reset_target
   F5_RESOLV_CONF="$T/target" container "$T/bridge-up" up
   rc=$?
   [ "$rc" -eq 0 ] && [ "$(cat "$T/target")" = "$STUB" ] && ok "$CASE leaves DNS alone" || no "expected the target untouched"
+
+  CASE="F5_BRIDGE_SYNC_DNS in the config file"
+  printf 'F5_BRIDGE_SYNC_DNS=1\n' >"$T/config"
+  reset_target
+  TEST_CONFIG="$T/config" F5_RESOLV_CONF="$T/target" container "$T/bridge-up" up
+  rc=$?
+  [ "$rc" -eq 0 ] && [ "$(cat "$T/target")" = "$STUB" ] && ok "$CASE is ignored" || no "expected the target untouched"
 
   CASE="up with a failed sync"
   F5_BRIDGE_SYNC_DNS=1 F5_RESOLV_CONF="$T/notadir/resolv.conf" container "$T/bridge-up" up
@@ -221,9 +288,22 @@ EOF
 
   CASE="up that fails, with F5_BRIDGE_SYNC_DNS=1"
   reset_target
-  F5_BRIDGE_SYNC_DNS=1 F5_RESOLV_CONF="$T/target" container "$T/bridge-wrong" up
+  chmod -x "$T/upbin/f5vpn-ng"
+  F5_BRIDGE_SYNC_DNS=1 F5_RESOLV_CONF="$T/target" container "$T/bridge-up" up
   rc=$?
-  [ "$rc" -eq 2 ] && [ "$(cat "$T/target")" = "$STUB" ] && ok "$CASE keeps its exit status" || no "expected exit 2"
+  chmod +x "$T/upbin/f5vpn-ng"
+  [ "$rc" -eq 1 ] && grep -q 'f5vpn-ng not found' "$T/out" && cmp -s "$T/target" "$T/vpn-expected" \
+    && ok "$CASE keeps its exit status and still syncs" || no "expected exit 1 and the target synced"
+
+  CASE="dns --apply with no nameserver from the host"
+  printf 'search platform.hmcts.net\n' >"$T/up-resolv"
+  reset_target
+  F5_BRIDGE_SYNC_DNS=1 F5_RESOLV_CONF="$T/target" container "$T/bridge-up" up
+  rc=$?
+  F5_RESOLV_CONF="$T/target" container "$T/bridge-up" dns --apply
+  rc2=$?
+  [ "$rc" -eq 0 ] && [ "$rc2" -eq 1 ] && [ "$(cat "$T/target")" = "$STUB" ] && grep -q 'no nameserver' "$T/out" \
+    && ok "$CASE is refused, and a sync only warns" || no "expected the target untouched"
 else
   echo "skip dns on the host (Linux only; macOS prints nothing)"
 fi
