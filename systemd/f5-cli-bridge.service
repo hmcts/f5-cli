@@ -4,10 +4,14 @@ Description=f5-cli bridge (lets a container drive f5-cli on this host)
 [Service]
 ExecStart=@BIN@ bridge serve
 # A sign-in window needs the session's display; desktop sessions import
-# DISPLAY / WAYLAND_DISPLAY into the user manager. Without one, `up` says to
-# run `f5-cli login` on the host instead.
+# DISPLAY / WAYLAND_DISPLAY into the user manager, and the bridge takes them
+# from there for each command. Without one, `up` says to run `f5-cli login`
+# on the host instead.
 Restart=on-failure
 RestartSec=10
+# Stopping or restarting the bridge leaves alone the VPN client that a bridged
+# `up` started, which is still in this unit's cgroup.
+KillMode=process
 
 [Install]
 WantedBy=default.target
