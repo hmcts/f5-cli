@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # Install f5-cli for the current user, on Linux or macOS.
 #
-#   ./install.sh [--prefix DIR] [--autostart]   install (default prefix ~/.local)
-#   ./install.sh --uninstall [--purge]          remove; --purge also deletes the
-#                                               browser profile, session and config
+#   ./install.sh [--prefix DIR] [--autostart] [--bridge [--bridge-port N]]
+#       install (default prefix ~/.local). --autostart connects when you log in;
+#       --bridge lets a container (a devcontainer, say) drive f5-cli on this
+#       host. Either, both or neither.
+#   ./install.sh --uninstall [--purge]
+#       remove; --purge also deletes the browser profile, session and config
 set -euo pipefail
 
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OS=$(uname -s)
 PREFIX=$HOME/.local
 AUTOSTART=0
+BRIDGE=0
+BRIDGE_PORT=47153
 UNINSTALL=0
 PURGE=0
 CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/f5-cli
@@ -18,6 +23,11 @@ UNIT=f5-cli.service
 AGENT_LABEL=net.hmcts.f5-cli
 AGENT=$HOME/Library/LaunchAgents/$AGENT_LABEL.plist
 AGENT_LOG=$HOME/Library/Logs/f5-cli.log
+BRIDGE_FILE=$CONFIG_DIR/bridge
+BRIDGE_UNIT=f5-cli-bridge.service
+BRIDGE_LABEL=net.hmcts.f5-cli.bridge
+BRIDGE_AGENT=$HOME/Library/LaunchAgents/$BRIDGE_LABEL.plist
+BRIDGE_LOG=$HOME/Library/Logs/f5-cli-bridge.log
 
 msg()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
@@ -28,14 +38,20 @@ while [ $# -gt 0 ]; do
     --prefix)    PREFIX=${2:?--prefix needs a directory}; shift ;;
     --prefix=*)  PREFIX=${1#--prefix=} ;;
     --autostart) AUTOSTART=1 ;;
+    --bridge)    BRIDGE=1 ;;
+    --bridge-port)   BRIDGE_PORT=${2:?--bridge-port needs a number}; shift ;;
+    --bridge-port=*) BRIDGE_PORT=${1#--bridge-port=} ;;
     --uninstall) UNINSTALL=1 ;;
     --purge)     PURGE=1 ;;
-    -h|--help)   sed -n '2,7s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,9s/^# \{0,1\}//p' "$0"; exit 0 ;;
     *)           die "unknown option: $1" ;;
   esac
   shift
 done
 BIN=$PREFIX/bin/f5-cli
+case $BRIDGE_PORT in
+  '' | *[!0-9]*) die "--bridge-port needs a number" ;;
+esac
 
 case $OS in
   Linux|Darwin) ;;
@@ -54,6 +70,18 @@ uninstall() {
     rm -f "$AGENT"
     msg "removed $AGENT"
   fi
+  if [ -f "$UNIT_DIR/$BRIDGE_UNIT" ]; then
+    systemctl --user disable --now "$BRIDGE_UNIT" 2>/dev/null || true
+    rm -f "$UNIT_DIR/$BRIDGE_UNIT"
+    systemctl --user daemon-reload 2>/dev/null || true
+    msg "removed $UNIT_DIR/$BRIDGE_UNIT"
+  fi
+  if [ -f "$BRIDGE_AGENT" ]; then
+    launchctl bootout "gui/$(id -u)/$BRIDGE_LABEL" 2>/dev/null || true
+    rm -f "$BRIDGE_AGENT"
+    msg "removed $BRIDGE_AGENT"
+  fi
+  rm -f "$BRIDGE_FILE"
   rm -f "$BIN" && msg "removed $BIN"
   if [ "$PURGE" = 1 ]; then
     rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/f5-cli" \
@@ -132,6 +160,51 @@ install_agent() {
   msg "to connect now through it: launchctl bootstrap gui/$(id -u) $AGENT"
 }
 
+# The bridge's token: a container holding it can run status, up, down, login
+# and session on this host, so it's private to you. A new one every install.
+write_bridge_file() {
+  local token
+  token=$(openssl rand -hex 32)
+  mkdir -p "$CONFIG_DIR"
+  (umask 077 && printf 'PORT=%s\nTOKEN=%s\n' "$BRIDGE_PORT" "$token" >"$BRIDGE_FILE")
+  chmod 600 "$BRIDGE_FILE"
+}
+
+# Unlike --autostart, the bridge starts now: it listens, but connects nothing
+# until a container asks it to.
+install_bridge_unit() {
+  command -v systemctl >/dev/null || die "--bridge needs systemd"
+  mkdir -p "$UNIT_DIR"
+  sed "s|@BIN@|$BIN|g" "$SRC/systemd/$BRIDGE_UNIT" >"$UNIT_DIR/$BRIDGE_UNIT"
+  systemctl --user daemon-reload
+  systemctl --user enable "$BRIDGE_UNIT" >/dev/null 2>&1
+  systemctl --user restart "$BRIDGE_UNIT" || die "the bridge did not start — see: journalctl --user -u $BRIDGE_UNIT"
+  msg "installed and started $UNIT_DIR/$BRIDGE_UNIT"
+}
+
+install_bridge_agent() {
+  mkdir -p "$(dirname "$BRIDGE_AGENT")" "$(dirname "$BRIDGE_LOG")"
+  sed -e "s|@BIN@|$BIN|g" -e "s|@LOG@|$BRIDGE_LOG|g" -e "s|@LABEL@|$BRIDGE_LABEL|g" \
+    "$SRC/launchd/f5-cli-bridge.plist" >"$BRIDGE_AGENT"
+  plutil -lint "$BRIDGE_AGENT" >/dev/null || die "generated $BRIDGE_AGENT does not parse"
+  launchctl bootout "gui/$(id -u)/$BRIDGE_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$BRIDGE_AGENT" || die "launchctl could not load $BRIDGE_AGENT"
+  msg "installed and started $BRIDGE_AGENT (log: $BRIDGE_LOG)"
+}
+
+install_bridge() {
+  local i
+  write_bridge_file
+  if [ "$OS" = Darwin ]; then install_bridge_agent; else install_bridge_unit; fi
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    "$BIN" bridge status >/dev/null 2>&1 && break
+    [ "$i" = 10 ] && { warn "the bridge isn't answering yet — check it with: f5-cli bridge status"; return 0; }
+    sleep 1
+  done
+  msg "bridge listening on 127.0.0.1:$BRIDGE_PORT; token in $BRIDGE_FILE"
+  msg "in the container, mount $CONFIG_DIR at the same place under its home (read-only) — see the README"
+}
+
 if [ "$UNINSTALL" = 1 ]; then
   uninstall
   exit 0
@@ -150,6 +223,10 @@ fi
 
 if [ "$AUTOSTART" = 1 ]; then
   if [ "$OS" = Darwin ]; then install_agent; else install_unit; fi
+fi
+
+if [ "$BRIDGE" = 1 ]; then
+  install_bridge
 fi
 
 case ":$PATH:" in

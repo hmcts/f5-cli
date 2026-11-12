@@ -1,0 +1,13 @@
+[Unit]
+Description=f5-cli bridge (lets a container drive f5-cli on this host)
+
+[Service]
+ExecStart=@BIN@ bridge serve
+# A sign-in window needs the session's display; desktop sessions import
+# DISPLAY / WAYLAND_DISPLAY into the user manager. Without one, `up` says to
+# run `f5-cli login` on the host instead.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
