@@ -136,11 +136,11 @@ f5-cli knows it's in a container from `/.dockerenv`, `/run/.containerenv`,
 `REMOTE_CONTAINERS` or `CODESPACES` (`F5_IN_CONTAINER=0|1` overrides that),
 and `f5-cli bridge mode` prints `container` or `host` accordingly. Tools that
 need to know whether f5-cli will forward should ask it with `f5-cli bridge
-mode` rather than repeat the detection. It reaches the host at `host.docker.internal` when that resolves and the
-bridge answers there, as on Docker Desktop, and otherwise at `127.0.0.1`,
-which is the host's own loopback for a container on the host's network
-(`--network=host`, as Linux devcontainers often are). `F5_BRIDGE_HOST`
-overrides it.
+mode` rather than repeat the detection. It reaches the host at
+`host.docker.internal` when that resolves and the bridge answers there, as on
+Docker Desktop, and otherwise at `127.0.0.1`, which is the host's own loopback
+for a container on the host's network (`--network=host`, as Linux
+devcontainers often are). `F5_BRIDGE_HOST` overrides it.
 
 ```sh
 f5-cli bridge status   # in the container: 0 answers, 1 set up but not answering, 2 not set up
@@ -163,9 +163,14 @@ every container with the mount shares. In a devcontainer:
 "containerEnv": { "F5_BRIDGE_SYNC_DNS": "1" }
 ```
 
-A macOS host has nothing to copy — Docker Desktop resolves
-through the host itself — so there `dns` prints nothing and `--apply` leaves
-the file alone.
+Even then, f5-cli copies only when it reached the bridge at `127.0.0.1`, which
+means the container shares the host's network, or at an `F5_BRIDGE_HOST` you
+set; over `host.docker.internal` it leaves DNS alone. It also skips the copy
+after an `up` or `down` that failed, and the host passes on nothing while its
+`/etc/resolv.conf` still names the VPN's servers after `svpn` has died.
+
+A macOS host has nothing to copy — Docker Desktop resolves through the host
+itself — so there `dns` prints nothing and `--apply` leaves the file alone.
 
 The bridge listens on the host's `127.0.0.1` only, runs nothing but those
 commands (and `version`), with no arguments, and only for a caller with the
