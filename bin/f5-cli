@@ -875,6 +875,12 @@ bridge_call() {
 }
 
 # 0: the bridge answers. 1: it's set up but doesn't. 2: it isn't set up.
+# Whether this f5-cli forwards to a bridge, for tools that would otherwise
+# repeat in_container. Needs no bridge.
+cmd_bridge_mode() {
+  if in_container; then echo container; else echo host; fi
+}
+
 cmd_bridge_status() {
   local host port out
   if [ ! -r "$BRIDGE_FILE" ]; then
@@ -1128,7 +1134,8 @@ usage: f5-cli <command>
   dns       print the resolver lines of /etc/resolv.conf (nothing on macOS)
 
   bridge status   whether the bridge for containers answers
-  bridge serve    run the bridge (install.sh --bridge does this for you)
+  bridge mode     'container' if f5-cli here forwards to a bridge, else 'host'
+  bridge serve   run the bridge (install.sh --bridge does this for you)
   dns --apply     in a container: copy the host's resolver lines into its
                   /etc/resolv.conf
 
@@ -1158,8 +1165,11 @@ if in_container; then
       exit
       ;;
     bridge)
-      [ "${2:-}" = status ] || die "in a container, only 'f5-cli bridge status' — the bridge itself runs on the host"
-      cmd_bridge_status; exit
+      case "${2:-}" in
+        status) cmd_bridge_status; exit ;;
+        mode)   cmd_bridge_mode; exit ;;
+        *)      die "in a container, only 'f5-cli bridge status' and 'f5-cli bridge mode' — the bridge itself runs on the host" ;;
+      esac
       ;;
   esac
 fi
@@ -1176,6 +1186,7 @@ case "${1:-help}" in
     case "${2:-}" in
       serve)  cmd_bridge_serve ;;
       status) cmd_bridge_status ;;
+      mode)   cmd_bridge_mode ;;
       *)      usage >&2; exit 2 ;;
     esac
     ;;

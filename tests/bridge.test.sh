@@ -81,6 +81,36 @@ container "$T/bridge" bridge serve
 rc=$?
 [ "$rc" -eq 1 ] && grep -q 'runs on the host' "$T/out" && ok "$CASE is refused" || no "expected a refusal"
 
+# mode <F5_IN_CONTAINER> [VAR=value...] — `bridge mode` with no bridge file.
+mode() {
+  local override=$1
+  shift
+  env -u F5_IN_CONTAINER -u REMOTE_CONTAINERS -u CODESPACES HOME="$T/home" F5_CLI_CONFIG=/dev/null \
+    F5_BRIDGE_FILE="$T/nope" ${override:+F5_IN_CONTAINER=$override} "$@" /bin/bash "$F5" bridge mode >"$T/out" 2>&1
+}
+
+CASE="bridge mode"
+mode 0
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$T/out")" = host ] && ok "$CASE on the host is 'host'" || no "expected 'host'"
+mode 1
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$T/out")" = container ] && ok "$CASE with F5_IN_CONTAINER=1 is 'container'" \
+  || no "expected 'container'"
+mode 0 REMOTE_CONTAINERS=true CODESPACES=true
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$T/out")" = host ] \
+  && ok "$CASE with F5_IN_CONTAINER=0 is 'host' whatever the container signs$([ -f /.dockerenv ] && echo ', /.dockerenv included')" \
+  || no "expected 'host'"
+mode '' REMOTE_CONTAINERS=true
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$T/out")" = container ] && ok "$CASE from REMOTE_CONTAINERS is 'container'" \
+  || no "expected 'container'"
+container "$T/nope" bridge mode
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$T/out")" = container ] && ok "$CASE in a container with no bridge is 'container'" \
+  || no "expected 'container' and exit 0"
+
 # ── with the bridge ──────────────────────────────────────────────────────────
 
 env HOME="$T/home" F5_CLI_CONFIG=/dev/null F5_IN_CONTAINER=0 F5_BRIDGE_FILE="$T/bridge" \

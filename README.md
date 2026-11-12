@@ -133,8 +133,10 @@ For a devcontainer:
 ```
 
 f5-cli knows it's in a container from `/.dockerenv`, `/run/.containerenv`,
-`REMOTE_CONTAINERS` or `CODESPACES` (`F5_IN_CONTAINER=0|1` overrides that).
-It reaches the host at `host.docker.internal` when that resolves and the
+`REMOTE_CONTAINERS` or `CODESPACES` (`F5_IN_CONTAINER=0|1` overrides that),
+and `f5-cli bridge mode` prints `container` or `host` accordingly. Tools that
+need to know whether f5-cli will forward should ask it with `f5-cli bridge
+mode` rather than repeat the detection. It reaches the host at `host.docker.internal` when that resolves and the
 bridge answers there, as on Docker Desktop, and otherwise at `127.0.0.1`,
 which is the host's own loopback for a container on the host's network
 (`--network=host`, as Linux devcontainers often are). `F5_BRIDGE_HOST`
