@@ -15,7 +15,7 @@
 # Written for bash 3.2, so it runs on the /bin/bash macOS ships.
 set -euo pipefail
 
-VERSION=0.2.0
+VERSION=0.3.0
 CONFIG=${F5_CLI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/f5-cli/config}
 OS=$(uname -s)
 
@@ -789,6 +789,216 @@ cmd_session() {
   msg "portal session is live"
 }
 
+# ─── Bridge ────────────────────────────────────────────────────────────────
+# The F5 client belongs to the host, so a container (a devcontainer, say)
+# can't run it. `install.sh --bridge` runs `f5-cli bridge serve` on the host:
+# a small HTTP server on the host's 127.0.0.1 that runs the commands in
+# BRIDGED, and nothing else, for a caller holding the token in BRIDGE_FILE.
+# With the host's config directory mounted into the container, f5-cli there
+# sends those commands to the bridge instead of running them.
+BRIDGE_FILE=${F5_BRIDGE_FILE:-$(dirname "$CONFIG")/bridge}
+BRIDGED="status up down login session version"
+BRIDGE_SENTINEL=__f5_cli_bridge_exit__
+
+# F5_IN_CONTAINER=0|1 overrides the detection.
+in_container() {
+  case ${F5_IN_CONTAINER:-} in
+    0) return 1 ;;
+    1) return 0 ;;
+  esac
+  [ -f /.dockerenv ] || [ -f /run/.containerenv ] || [ -n "${REMOTE_CONTAINERS:-}" ] || [ -n "${CODESPACES:-}" ]
+}
+
+bridge_value() { sed -n "s/^$1=//p" "$BRIDGE_FILE" 2>/dev/null | tail -n 1; }
+
+# Docker Desktop reaches the host's loopback as host.docker.internal. A
+# container on the host's network (--network=host on Linux) shares it. On
+# Docker Engine, --add-host=host.docker.internal:host-gateway names the
+# docker0 gateway instead, which can't reach a bridge on 127.0.0.1, so it's
+# used only if the bridge answers there.
+bridge_host() {
+  if [ -n "${F5_BRIDGE_HOST:-}" ]; then
+    echo "$F5_BRIDGE_HOST"
+  elif getent hosts host.docker.internal >/dev/null 2>&1 \
+    && curl -s -o /dev/null --connect-timeout 3 "http://host.docker.internal:$(bridge_value PORT)/"; then
+    echo host.docker.internal
+  else
+    echo 127.0.0.1
+  fi
+}
+
+# Runs one command on the host through the bridge, streaming its output, and
+# returns its exit status. The token goes to curl on stdin, never in argv.
+# No --max-time: `up` can wait for another f5-cli's lock and then sign in,
+# and the server always ends with the exit status.
+bridge_call() {
+  local cmd=$1 host port token line rc=
+  [ -r "$BRIDGE_FILE" ] \
+    || die "no f5-cli bridge is set up — run 'install.sh --bridge' on the host, and mount its $(dirname "$BRIDGE_FILE") into this container"
+  port=$(bridge_value PORT)
+  token=$(bridge_value TOKEN)
+  [ -n "$port" ] && [ -n "$token" ] || die "$BRIDGE_FILE is incomplete — re-run 'install.sh --bridge' on the host"
+  command -v curl >/dev/null || die "the bridge needs curl"
+  host=$(bridge_host)
+  while IFS= read -r line; do
+    case $line in
+      "$BRIDGE_SENTINEL "*) rc=${line#"$BRIDGE_SENTINEL "} ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < <(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+    | curl -sS -N --connect-timeout 3 --config - --data-raw "$cmd" "http://$host:$port/run" 2>&1)
+  case $rc in
+    '' | *[!0-9]*) die "no answer from the f5-cli bridge at $host:$port — is it running on the host? ('install.sh --bridge' there)" ;;
+  esac
+  return "$rc"
+}
+
+# 0: the bridge answers. 1: it's set up but doesn't. 2: it isn't set up.
+cmd_bridge_status() {
+  local host port out
+  if [ ! -r "$BRIDGE_FILE" ]; then
+    echo "bridge: not set up — run 'install.sh --bridge' on the host"
+    return 2
+  fi
+  if in_container; then host=$(bridge_host); else host=127.0.0.1; fi
+  port=$(bridge_value PORT)
+  if out=$(F5_BRIDGE_HOST=$host bridge_call version 2>&1); then
+    echo "bridge: http://$host:$port — host runs $out"
+    return 0
+  fi
+  echo "bridge: http://$host:$port — not answering: $(printf '%s\n' "$out" | tail -n 1)"
+  return 1
+}
+
+# Standard library only, and Python 3.9, which is what macOS's Command Line
+# Tools ship. Run as: python3 -c "$BRIDGE_SERVER" <bridge-file> <f5-cli>.
+BRIDGE_SERVER='
+import hmac
+import http.server
+import os
+import subprocess
+import sys
+
+ALLOWED = sys.argv[3].split()
+SENTINEL = sys.argv[4]
+
+
+def load(path):
+    state = {}
+    with open(path) as f:
+        for line in f:
+            key, sep, value = line.strip().partition("=")
+            if sep:
+                state[key] = value
+    for key in ("PORT", "TOKEN"):
+        if not state.get(key):
+            sys.exit(f"f5-cli bridge: {path} has no {key}; re-run install.sh --bridge")
+    return state
+
+
+# A desktop session imports its display into the user manager, often after
+# this server has started at login, so take it from there for each command.
+def session_env():
+    env = dict(os.environ)
+    if sys.platform == "darwin":
+        return env
+    try:
+        out = subprocess.run(["systemctl", "--user", "show-environment"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return env
+    for line in out.decode("utf-8", "replace").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"):
+            env[key] = value
+    return env
+
+
+def handler(token, f5):
+    expected = ("Bearer " + token).encode()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        # No Content-Length: the response ends when the connection closes,
+        # so the output streams while the command runs.
+        protocol_version = "HTTP/1.0"
+        # Bounds each read of the request, so an idle connection cannot hold
+        # a thread. Cleared before the command runs, however long it is quiet.
+        timeout = 30
+
+        def do_POST(self):
+            if self.path != "/run":
+                return self.refuse(404, "no such endpoint")
+            if not hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected):
+                return self.refuse(401, "bad token; re-run install.sh --bridge on the host")
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 64:
+                return self.refuse(400, "request too large")
+            cmd = self.rfile.read(length).decode("utf-8", "replace").strip()
+            self.connection.settimeout(None)
+            if cmd not in ALLOWED:
+                return self.refuse(400, f"not a bridged command: {cmd!r}")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            proc = subprocess.Popen([f5, cmd], stdin=subprocess.DEVNULL, env=session_env(),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            try:
+                last = b"\n"
+                for line in proc.stdout:
+                    self.wfile.write(line)
+                    self.wfile.flush()
+                    last = line[-1:]
+                # The sentinel has to start a line of its own.
+                if last != b"\n":
+                    self.wfile.write(b"\n")
+                rc = proc.wait()
+                # Killed by a signal: report it as a shell would, 128+N.
+                if rc < 0:
+                    rc = 128 - rc
+                self.wfile.write(f"{SENTINEL} {rc}\n".encode())
+            except (BrokenPipeError, ConnectionResetError):
+                # The caller went away. Let the command finish, draining its
+                # output so it cannot block on a full pipe.
+                for _ in proc.stdout:
+                    pass
+                proc.wait()
+
+        def do_GET(self):
+            self.refuse(405, "use POST /run")
+
+        def refuse(self, code, message):
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(f"f5-cli bridge: {message}\n{SENTINEL} 2\n".encode())
+
+        def log_message(self, fmt, *args):
+            # The request line and status only, never the headers.
+            sys.stderr.write(f"{self.log_date_time_string()} {fmt % args}\n")
+
+    return Handler
+
+
+state = load(sys.argv[1])
+bind = state.get("BIND") or "127.0.0.1"
+port = int(state["PORT"])
+server = http.server.ThreadingHTTPServer((bind, port), handler(state["TOKEN"], sys.argv[2]))
+sys.stderr.write(f"f5-cli bridge: listening on {bind}:{port}\n")
+sys.stderr.flush()
+try:
+    server.serve_forever()
+except KeyboardInterrupt:
+    pass
+'
+
+cmd_bridge_serve() {
+  local self
+  in_container && die "the bridge runs on the host, not in a container"
+  [ -r "$BRIDGE_FILE" ] || die "no $BRIDGE_FILE — run 'install.sh --bridge'"
+  self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  exec python3 -I -c "$BRIDGE_SERVER" "$BRIDGE_FILE" "$self" "$BRIDGED" "$BRIDGE_SENTINEL"
+}
+
 # A second client hands its URI to the running one, which drops the session
 # it was bringing up, so commands that start or stop the client take turns.
 # Children are started with fd 9 closed so the client can't keep the lock.
@@ -826,9 +1036,26 @@ usage: f5-cli <command>
   session   check the portal session, refreshing it if needed
   version   print the version
 
+  bridge status   whether the bridge for containers answers
+  bridge serve    run the bridge (install.sh --bridge does this for you)
+
+In a container, status, up, down, login and session run on the host through
+its bridge — see 'install.sh --bridge'.
+
 portal: $PORTAL   config: $CONFIG
 EOF
 }
+
+# In a container, everything that drives the client goes through the bridge.
+if in_container; then
+  case "${1:-help}" in
+    status|up|down|login|session) bridge_call "$1"; exit ;;
+    bridge)
+      [ "${2:-}" = status ] || die "in a container, only 'f5-cli bridge status' — the bridge itself runs on the host"
+      cmd_bridge_status; exit
+      ;;
+  esac
+fi
 
 case "${1:-help}" in
   up)                  take_lock; cmd_up ;;
@@ -837,6 +1064,13 @@ case "${1:-help}" in
   login)               take_lock; cmd_login ;;
   session)             take_lock; cmd_session ;;
   version|--version)   echo "f5-cli $VERSION" ;;
+  bridge)
+    case "${2:-}" in
+      serve)  cmd_bridge_serve ;;
+      status) cmd_bridge_status ;;
+      *)      usage >&2; exit 2 ;;
+    esac
+    ;;
   help|--help|-h)      usage ;;
   *)                   usage >&2; exit 2 ;;
 esac

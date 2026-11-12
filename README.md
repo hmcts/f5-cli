@@ -45,8 +45,10 @@ git clone https://github.com/hmcts/f5-cli.git
 cd f5-cli
 ./install.sh               # installs ~/.local/bin/f5-cli
 ./install.sh --autostart   # ...and connects automatically when you log in
+./install.sh --bridge      # ...and lets a container on this machine drive it
 ```
 
+`--autostart` and `--bridge` are independent: use either, both or neither.
 `--prefix DIR` installs somewhere other than `~/.local`.
 `./install.sh --uninstall` removes it; add `--purge` to also delete the browser
 profile, saved session and config.
@@ -97,6 +99,58 @@ launchctl kickstart -k gui/$(id -u)/net.hmcts.f5-cli   # reconnect
 F5 VPN disconnects when the Mac sleeps, and the agent only runs at login, so
 after a sleep run `f5-cli up` again.
 
+### From a container
+
+The F5 client runs on your machine, so a container — a devcontainer, say —
+can't start it. With the bridge, f5-cli inside the container sends `status`,
+`up`, `down`, `login` and `session` to the host, which runs them and streams
+the output and exit status back. Everything else about them is the same: a
+sign-in window opens on the host's screen.
+
+**On the host**, once:
+
+```sh
+./install.sh --bridge          # --bridge-port N if 47153 is taken
+f5-cli bridge status           # bridge: http://127.0.0.1:47153 — host runs f5-cli …
+```
+
+That installs and starts a LaunchAgent (`net.hmcts.f5-cli.bridge`, log in
+`~/Library/Logs/f5-cli-bridge.log`) or a systemd user unit
+(`f5-cli-bridge.service`), and writes a fresh random token to
+`~/.config/f5-cli/bridge` (mode 0600).
+
+**In the container**, f5-cli needs `curl`, the f5-cli script itself (copy or
+clone it; nothing else from the install is needed), and the host's
+`~/.config/f5-cli` mounted at `~/.config/f5-cli` under the container's home.
+For a devcontainer:
+
+```jsonc
+// devcontainer.json
+"initializeCommand": "mkdir -p ~/.config/f5-cli",
+"mounts": [
+  "source=${localEnv:HOME}/.config/f5-cli,target=/home/<container-user>/.config/f5-cli,type=bind,readonly"
+]
+```
+
+f5-cli knows it's in a container from `/.dockerenv`, `/run/.containerenv`,
+`REMOTE_CONTAINERS` or `CODESPACES` (`F5_IN_CONTAINER=0|1` overrides that).
+It reaches the host at `host.docker.internal` when that resolves and the
+bridge answers there, as on Docker Desktop, and otherwise at `127.0.0.1`,
+which is the host's own loopback for a container on the host's network
+(`--network=host`, as Linux devcontainers often are). `F5_BRIDGE_HOST`
+overrides it.
+
+```sh
+f5-cli bridge status   # in the container: 0 answers, 1 set up but not answering, 2 not set up
+```
+
+The bridge listens on the host's `127.0.0.1` only, runs nothing but those
+commands (and `version`), with no arguments, and only for a caller with the
+token. Any process on the host — and, on Docker Desktop, any container — can
+reach the port, which is what the token is for: treat the file like a
+password. `./install.sh --uninstall` removes the bridge and the token, and
+re-running `--bridge` replaces the token.
+
 ## Configuration
 
 `~/.config/f5-cli/config` holds `KEY=value` lines; environment variables of the
@@ -111,6 +165,8 @@ same name override it. Everything is optional — see
 | `F5_BROWSER_PROFILE` | `~/.local/share/f5-cli/browser` (`~/snap/<name>/common/f5-cli` for a snap browser) |
 | `F5_CLIENT` | `f5vpn-ng` on `PATH` (macOS: `/Applications/F5 VPN.app`) |
 | `F5_EPI` | macOS only: `/Applications/F5 Endpoint Inspector.app` |
+| `F5_BRIDGE_HOST` | in a container: `host.docker.internal` if the bridge answers there, else `127.0.0.1` |
+| `F5_BRIDGE_FILE` | `~/.config/f5-cli/bridge` — the bridge's port and token |
 | `F5_CLI_NETWORK_WAIT` | `0` — seconds `up` waits for the portal to resolve |
 
 ## How it works
@@ -174,6 +230,17 @@ client.
 **`up` times out on macOS with no tunnel.** Look for a dialog from F5 VPN — an
 offer to update the client is the usual one. Answer it and run `f5-cli up`
 again.
+
+**In a container: `no answer from the f5-cli bridge`.** The bridge isn't
+running on the host, or something else holds its port. On the host, run
+`f5-cli bridge status`, check its log (`~/Library/Logs/f5-cli-bridge.log`, or
+`journalctl --user -u f5-cli-bridge`), and re-run `./install.sh --bridge`.
+
+**In a container: `bad token`.** The container's token isn't the one the
+bridge was started with. Check that the container mounts the host's
+`~/.config/f5-cli` (and that `F5_BRIDGE_FILE` isn't set), then re-run
+`./install.sh --bridge` on the host, which writes a new token and restarts the
+bridge with it.
 
 **Logs.** `$XDG_RUNTIME_DIR/f5-cli/` holds the client and browser output from
 the last run; the client also logs to `~/.F5Networks/f5vpn.log`, and `svpn` to

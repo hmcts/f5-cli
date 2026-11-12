@@ -10,14 +10,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck bin/f5-cli install.sh
-      - run: systemd-analyze verify --user systemd/f5-cli.service || true
+      - run: shellcheck bin/f5-cli install.sh tests/*.sh
+      - run: |
+          systemd-analyze verify --user systemd/f5-cli.service || true
+          systemd-analyze verify --user systemd/f5-cli-bridge.service || true
+      - name: bridge
+        run: bash tests/bridge.test.sh
 
   macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       # /bin/bash is 3.2 on macOS; the script must parse and run under it.
-      - run: /bin/bash -n bin/f5-cli && /bin/bash -n install.sh
+      - run: /bin/bash -n bin/f5-cli && /bin/bash -n install.sh && /bin/bash -n tests/bridge.test.sh
       - run: /bin/bash bin/f5-cli version && /bin/bash bin/f5-cli help
-      - run: plutil -lint launchd/f5-cli.plist
+      - run: plutil -lint launchd/f5-cli.plist launchd/f5-cli-bridge.plist
+      # The bridge's server runs on macOS's own python3 (3.9 with the Command Line Tools).
+      - name: bridge
+        run: /bin/bash tests/bridge.test.sh
