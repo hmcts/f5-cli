@@ -187,7 +187,14 @@ install_bridge_agent() {
   sed -e "s|@BIN@|$BIN|g" -e "s|@LOG@|$BRIDGE_LOG|g" -e "s|@LABEL@|$BRIDGE_LABEL|g" \
     "$SRC/launchd/f5-cli-bridge.plist" >"$BRIDGE_AGENT"
   plutil -lint "$BRIDGE_AGENT" >/dev/null || die "generated $BRIDGE_AGENT does not parse"
+  local i
   launchctl bootout "gui/$(id -u)/$BRIDGE_LABEL" 2>/dev/null || true
+  # bootout returns before the job is gone, and bootstrapping it again before
+  # then fails with "Bootstrap failed: 5".
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl print "gui/$(id -u)/$BRIDGE_LABEL" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
   launchctl bootstrap "gui/$(id -u)" "$BRIDGE_AGENT" || die "launchctl could not load $BRIDGE_AGENT"
   msg "installed and started $BRIDGE_AGENT (log: $BRIDGE_LOG)"
 }
@@ -197,7 +204,7 @@ install_bridge() {
   write_bridge_file
   if [ "$OS" = Darwin ]; then install_bridge_agent; else install_bridge_unit; fi
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    "$BIN" bridge status >/dev/null 2>&1 && break
+    F5_BRIDGE_FILE=$BRIDGE_FILE "$BIN" bridge status >/dev/null 2>&1 && break
     [ "$i" = 10 ] && { warn "the bridge isn't answering yet — check it with: f5-cli bridge status"; return 0; }
     sleep 1
   done

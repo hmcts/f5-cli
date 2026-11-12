@@ -812,11 +812,15 @@ in_container() {
 bridge_value() { sed -n "s/^$1=//p" "$BRIDGE_FILE" 2>/dev/null | tail -n 1; }
 
 # Docker Desktop reaches the host's loopback as host.docker.internal. A
-# container on the host's network (--network=host on Linux) shares it.
+# container on the host's network (--network=host on Linux) shares it. On
+# Docker Engine, --add-host=host.docker.internal:host-gateway names the
+# docker0 gateway instead, which can't reach a bridge on 127.0.0.1, so it's
+# used only if the bridge answers there.
 bridge_host() {
   if [ -n "${F5_BRIDGE_HOST:-}" ]; then
     echo "$F5_BRIDGE_HOST"
-  elif getent hosts host.docker.internal >/dev/null 2>&1; then
+  elif getent hosts host.docker.internal >/dev/null 2>&1 \
+    && curl -s -o /dev/null --connect-timeout 3 "http://host.docker.internal:$(bridge_value PORT)/"; then
     echo host.docker.internal
   else
     echo 127.0.0.1
@@ -825,6 +829,8 @@ bridge_host() {
 
 # Runs one command on the host through the bridge, streaming its output, and
 # returns its exit status. The token goes to curl on stdin, never in argv.
+# No --max-time: `up` can wait for another f5-cli's lock and then sign in,
+# and the server always ends with the exit status.
 bridge_call() {
   local cmd=$1 host port token line rc=
   [ -r "$BRIDGE_FILE" ] \
@@ -840,7 +846,7 @@ bridge_call() {
       *) printf '%s\n' "$line" ;;
     esac
   done < <(printf 'header = "Authorization: Bearer %s"\n' "$token" \
-    | curl -sS -N --connect-timeout 3 --max-time 900 --config - --data-raw "$cmd" "http://$host:$port/run" 2>&1)
+    | curl -sS -N --connect-timeout 3 --config - --data-raw "$cmd" "http://$host:$port/run" 2>&1)
   case $rc in
     '' | *[!0-9]*) die "no answer from the f5-cli bridge at $host:$port — is it running on the host? ('install.sh --bridge' there)" ;;
   esac
@@ -869,6 +875,7 @@ cmd_bridge_status() {
 BRIDGE_SERVER='
 import hmac
 import http.server
+import os
 import subprocess
 import sys
 
@@ -889,6 +896,24 @@ def load(path):
     return state
 
 
+# A desktop session imports its display into the user manager, often after
+# this server has started at login, so take it from there for each command.
+def session_env():
+    env = dict(os.environ)
+    if sys.platform == "darwin":
+        return env
+    try:
+        out = subprocess.run(["systemctl", "--user", "show-environment"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return env
+    for line in out.decode("utf-8", "replace").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"):
+            env[key] = value
+    return env
+
+
 def handler(token, f5):
     expected = ("Bearer " + token).encode()
 
@@ -896,6 +921,9 @@ def handler(token, f5):
         # No Content-Length: the response ends when the connection closes,
         # so the output streams while the command runs.
         protocol_version = "HTTP/1.0"
+        # Bounds each read of the request, so an idle connection cannot hold
+        # a thread. Cleared before the command runs, however long it is quiet.
+        timeout = 30
 
         def do_POST(self):
             if self.path != "/run":
@@ -906,18 +934,28 @@ def handler(token, f5):
             if length > 64:
                 return self.refuse(400, "request too large")
             cmd = self.rfile.read(length).decode("utf-8", "replace").strip()
+            self.connection.settimeout(None)
             if cmd not in ALLOWED:
                 return self.refuse(400, f"not a bridged command: {cmd!r}")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            proc = subprocess.Popen([f5, cmd], stdin=subprocess.DEVNULL,
+            proc = subprocess.Popen([f5, cmd], stdin=subprocess.DEVNULL, env=session_env(),
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             try:
+                last = b"\n"
                 for line in proc.stdout:
                     self.wfile.write(line)
                     self.wfile.flush()
-                self.wfile.write(f"{SENTINEL} {proc.wait()}\n".encode())
+                    last = line[-1:]
+                # The sentinel has to start a line of its own.
+                if last != b"\n":
+                    self.wfile.write(b"\n")
+                rc = proc.wait()
+                # Killed by a signal: report it as a shell would, 128+N.
+                if rc < 0:
+                    rc = 128 - rc
+                self.wfile.write(f"{SENTINEL} {rc}\n".encode())
             except (BrokenPipeError, ConnectionResetError):
                 # The caller went away. Let the command finish, draining its
                 # output so it cannot block on a full pipe.

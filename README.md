@@ -134,10 +134,11 @@ For a devcontainer:
 
 f5-cli knows it's in a container from `/.dockerenv`, `/run/.containerenv`,
 `REMOTE_CONTAINERS` or `CODESPACES` (`F5_IN_CONTAINER=0|1` overrides that).
-It reaches the host at `host.docker.internal` when that resolves, as on Docker
-Desktop, and otherwise at `127.0.0.1`, which is the host's own loopback for a
-container on the host's network (`--network=host`, as Linux devcontainers
-often are). `F5_BRIDGE_HOST` overrides it.
+It reaches the host at `host.docker.internal` when that resolves and the
+bridge answers there, as on Docker Desktop, and otherwise at `127.0.0.1`,
+which is the host's own loopback for a container on the host's network
+(`--network=host`, as Linux devcontainers often are). `F5_BRIDGE_HOST`
+overrides it.
 
 ```sh
 f5-cli bridge status   # in the container: 0 answers, 1 set up but not answering, 2 not set up
@@ -164,7 +165,7 @@ same name override it. Everything is optional — see
 | `F5_BROWSER_PROFILE` | `~/.local/share/f5-cli/browser` (`~/snap/<name>/common/f5-cli` for a snap browser) |
 | `F5_CLIENT` | `f5vpn-ng` on `PATH` (macOS: `/Applications/F5 VPN.app`) |
 | `F5_EPI` | macOS only: `/Applications/F5 Endpoint Inspector.app` |
-| `F5_BRIDGE_HOST` | in a container: `host.docker.internal` if it resolves, else `127.0.0.1` |
+| `F5_BRIDGE_HOST` | in a container: `host.docker.internal` if the bridge answers there, else `127.0.0.1` |
 | `F5_BRIDGE_FILE` | `~/.config/f5-cli/bridge` — the bridge's port and token |
 | `F5_CLI_NETWORK_WAIT` | `0` — seconds `up` waits for the portal to resolve |
 

@@ -29,6 +29,9 @@
   <true/>
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
+  <!-- Unloading the bridge leaves alone anything a bridged command started. -->
+  <key>AbandonProcessGroup</key>
+  <true/>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
