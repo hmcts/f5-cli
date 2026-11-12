@@ -23,3 +23,7 @@ F5_PORTAL=portal.platform.hmcts.net
 
 # macOS only: the endpoint inspector, a separate app there.
 #F5_EPI=/Applications/F5 Endpoint Inspector.app
+
+# In a container on the host's network: copy the host's DNS into the
+# container's /etc/resolv.conf after a bridged up or down.
+#F5_BRIDGE_SYNC_DNS=1

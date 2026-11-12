@@ -41,7 +41,7 @@ load_config() {
   while IFS='=' read -r key value; do
     key=${key//[[:space:]]/}
     case $key in
-      F5_PORTAL|F5_RESOURCE|F5_BROWSER|F5_BROWSER_PROFILE|F5_CLIENT|F5_EPI|F5_CLI_NETWORK_WAIT) ;;
+      F5_PORTAL|F5_RESOURCE|F5_BROWSER|F5_BROWSER_PROFILE|F5_CLIENT|F5_EPI|F5_CLI_NETWORK_WAIT|F5_BRIDGE_SYNC_DNS) ;;
       *) continue ;;
     esac
     [ -z "${!key:-}" ] || continue
@@ -797,7 +797,7 @@ cmd_session() {
 # With the host's config directory mounted into the container, f5-cli there
 # sends those commands to the bridge instead of running them.
 BRIDGE_FILE=${F5_BRIDGE_FILE:-$(dirname "$CONFIG")/bridge}
-BRIDGED="status up down login session version"
+BRIDGED="status up down login session version dns"
 BRIDGE_SENTINEL=__f5_cli_bridge_exit__
 
 # F5_IN_CONTAINER=0|1 overrides the detection.
@@ -861,6 +861,66 @@ cmd_bridge_status() {
     return 0
   fi
   echo "bridge: http://$host:$port — not answering: $(printf '%s\n' "$out" | tail -n 1)"
+  return 1
+}
+
+# svpn points the host's /etc/resolv.conf at the VPN's DNS, but a container on
+# the host's network resolving through resolved's stub at 127.0.0.53 never
+# hears of it. `dns` prints the host's resolver lines so a container can copy
+# them. On macOS svpn leaves /etc/resolv.conf alone and uses split DNS, which
+# Docker Desktop's own resolver already follows, so there is nothing to copy.
+# F5_RESOLV_CONF is for the tests.
+RESOLV_CONF=${F5_RESOLV_CONF:-/etc/resolv.conf}
+
+resolv_lines() { grep -E '^[[:space:]]*(nameserver|search|domain|options)([[:space:]]|$)' || true; }
+
+cmd_dns() {
+  case ${1:-} in
+    '') ;;
+    --apply) die "'dns --apply' copies the host's DNS into a container; on the host there is nothing to do" ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  [ "$OS" = Darwin ] && return 0
+  [ -r "$RESOLV_CONF" ] || die "cannot read $RESOLV_CONF"
+  resolv_lines <"$RESOLV_CONF"
+}
+
+# The host's resolver lines, through the bridge.
+bridge_dns() {
+  local out rc=0
+  out=$(bridge_call dns) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    case $out in
+      *"not a bridged command"*)
+        warn "the host's f5-cli is too old for dns — update it there and re-run 'install.sh --bridge'"
+        return 1
+        ;;
+    esac
+    [ -z "$out" ] || printf '%s\n' "$out" >&2
+    return "$rc"
+  fi
+  printf '%s\n' "$out" | resolv_lines
+}
+
+# Docker bind-mounts /etc/resolv.conf into the container, so it can be
+# rewritten but not replaced: a write in place, never a rename.
+dns_apply() {
+  local lines
+  lines=$(bridge_dns) || return 1
+  if [ -z "$lines" ]; then
+    msg "the host has no DNS for a container to copy — $RESOLV_CONF left alone"
+    return 0
+  fi
+  if [ "$(cat "$RESOLV_CONF" 2>/dev/null)" = "$lines" ]; then
+    msg "$RESOLV_CONF already has the host's DNS"
+    return 0
+  fi
+  if { printf '%s\n' "$lines" >"$RESOLV_CONF"; } 2>/dev/null \
+    || printf '%s\n' "$lines" | sudo -n tee "$RESOLV_CONF" >/dev/null 2>&1; then
+    msg "copied the host's DNS to $RESOLV_CONF:$(printf '%s\n' "$lines" | awk '$1 == "nameserver" {printf " %s", $2}')"
+    return 0
+  fi
+  warn "could not write $RESOLV_CONF — run as root, or with sudo that needs no password"
   return 1
 }
 
@@ -997,12 +1057,16 @@ usage: f5-cli <command>
   status    show the tunnel; exits non-zero when not connected
   session   check the portal session, refreshing it if needed
   version   print the version
+  dns       print the resolver lines of /etc/resolv.conf (nothing on macOS)
 
   bridge status   whether the bridge for containers answers
   bridge serve    run the bridge (install.sh --bridge does this for you)
+  dns --apply     in a container: copy the host's resolver lines into its
+                  /etc/resolv.conf
 
-In a container, status, up, down, login and session run on the host through
-its bridge — see 'install.sh --bridge'.
+In a container, status, up, down, login, session and dns run on the host
+through its bridge — see 'install.sh --bridge'. With F5_BRIDGE_SYNC_DNS=1, up
+and down then also run 'dns --apply'.
 
 portal: $PORTAL   config: $CONFIG
 EOF
@@ -1011,7 +1075,22 @@ EOF
 # In a container, everything that drives the client goes through the bridge.
 if in_container; then
   case "${1:-help}" in
-    status|up|down|login|session) bridge_call "$1"; exit ;;
+    status|login|session) bridge_call "$1"; exit ;;
+    # Whatever up or down exits with: an `up` that finds the tunnel already
+    # there exits 0, and the sync then repairs a container left on stale DNS.
+    up|down)
+      rc=0
+      bridge_call "$1" || rc=$?
+      [ "${F5_BRIDGE_SYNC_DNS:-0}" = 1 ] && { dns_apply || true; }
+      exit "$rc"
+      ;;
+    dns)
+      case ${2:-} in
+        '')      bridge_dns; exit ;;
+        --apply) dns_apply; exit ;;
+        *)       usage >&2; exit 2 ;;
+      esac
+      ;;
     bridge)
       [ "${2:-}" = status ] || die "in a container, only 'f5-cli bridge status' — the bridge itself runs on the host"
       cmd_bridge_status; exit
@@ -1026,6 +1105,7 @@ case "${1:-help}" in
   login)               take_lock; cmd_login ;;
   session)             take_lock; cmd_session ;;
   version|--version)   echo "f5-cli $VERSION" ;;
+  dns)                 cmd_dns "${2:-}" ;;
   bridge)
     case "${2:-}" in
       serve)  cmd_bridge_serve ;;

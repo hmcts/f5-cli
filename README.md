@@ -103,9 +103,9 @@ after a sleep run `f5-cli up` again.
 
 The F5 client runs on your machine, so a container — a devcontainer, say —
 can't start it. With the bridge, f5-cli inside the container sends `status`,
-`up`, `down`, `login` and `session` to the host, which runs them and streams
-the output and exit status back. Everything else about them is the same: a
-sign-in window opens on the host's screen.
+`up`, `down`, `login`, `session` and `dns` to the host, which runs them and
+streams the output and exit status back. Everything else about them is the
+same: a sign-in window opens on the host's screen.
 
 **On the host**, once:
 
@@ -143,6 +143,20 @@ often are). `F5_BRIDGE_HOST` overrides it.
 f5-cli bridge status   # in the container: 0 answers, 1 set up but not answering, 2 not set up
 ```
 
+**DNS.** On a Linux host, `svpn` points the host's `/etc/resolv.conf` at the
+VPN's DNS servers, but a container on the host's network that resolves through
+systemd-resolved's stub (`127.0.0.53`) never learns them, so internal names
+fail there even with the tunnel up. `f5-cli dns` prints the host's
+`nameserver`, `search`, `domain` and `options` lines, and in the container
+`f5-cli dns --apply` writes them to its `/etc/resolv.conf` — in place, since
+Docker bind-mounts that file — as root or with `sudo` that needs no password.
+Set `F5_BRIDGE_SYNC_DNS=1` in the container to do that after every `up` and
+`down`; `up` exits 0 when already connected, so it also repairs stale DNS. It
+is off by default because copying the host's DNS only makes sense with
+`--network=host`. A macOS host has nothing to copy — Docker Desktop resolves
+through the host itself — so there `dns` prints nothing and `--apply` leaves
+the file alone.
+
 The bridge listens on the host's `127.0.0.1` only, runs nothing but those
 commands (and `version`), with no arguments, and only for a caller with the
 token. Any process on the host — and, on Docker Desktop, any container — can
@@ -166,6 +180,7 @@ same name override it. Everything is optional — see
 | `F5_EPI` | macOS only: `/Applications/F5 Endpoint Inspector.app` |
 | `F5_BRIDGE_HOST` | in a container: `host.docker.internal` if it resolves, else `127.0.0.1` |
 | `F5_BRIDGE_FILE` | `~/.config/f5-cli/bridge` — the bridge's port and token |
+| `F5_BRIDGE_SYNC_DNS` | `0` — in a container, `1` copies the host's DNS after `up` and `down` |
 | `F5_CLI_NETWORK_WAIT` | `0` — seconds `up` waits for the portal to resolve |
 
 ## How it works
