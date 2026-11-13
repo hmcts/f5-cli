@@ -126,8 +126,8 @@ grep -q right-token "$T/server.log" && no "the token appeared in the server log"
 
 # ── dns ──────────────────────────────────────────────────────────────────────
 #
-# F5_RESOLV_CONF stands in for /etc/resolv.conf: on the host, and $T/target in
-# the container. A hard link to the target shows it was written in place, as a
+# F5_RESOLV_CONF stands in for /etc/resolv.conf on each side: the host's
+# fixture on the host, $T/target in the container. A hard link to the target shows it was written in place, as a
 # bind-mounted /etc/resolv.conf has to be.
 
 STUB='nameserver 127.0.0.53'
@@ -252,6 +252,15 @@ RESOLV
   rc=$?
   [ "$rc" -eq 0 ] && grep -q 'could not write' "$T/out" && ok "$CASE keeps up's exit status and warns" \
     || no "expected exit 0 and a warning"
+
+  CASE="up, host DNS with no nameserver"
+  connected yes
+  printf 'search platform.hmcts.net\n' >"$T/up-resolv"
+  reset_target
+  F5_RESOLV_CONF="$T/target" container "$T/bridge-up" up
+  rc=$?
+  [ "$rc" -eq 0 ] && [ "$(cat "$T/target")" = "$STUB" ] && ok "$CASE leaves the container's DNS alone" \
+    || no "expected exit 0 and the target untouched"
 
   # A curl shim takes host.docker.internal to 127.0.0.1, where the bridge answers.
   mkdir -p "$T/hdibin"

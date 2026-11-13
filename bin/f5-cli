@@ -907,9 +907,10 @@ cmd_bridge_status() {
 # hears of it, so after a bridged up or down the container copies the host's
 # resolver lines. On macOS svpn leaves /etc/resolv.conf alone and Docker
 # Desktop's resolver already follows the VPN, so `dns` prints nothing there.
+RESOLV_KEYS='^[[:space:]]*(nameserver|search|domain|options)([[:space:]]|$)'
 cmd_dns() {
   [ "$OS" = Darwin ] && return 0
-  grep -E '^[[:space:]]*(nameserver|search|domain|options)([[:space:]]|$)' "$RESOLV_CONF" || true
+  grep -E "$RESOLV_KEYS" "$RESOLV_CONF" || true
 }
 
 # Only a bridge reached at 127.0.0.1 means the container shares the host's
@@ -918,7 +919,9 @@ cmd_dns() {
 sync_dns() {
   local lines
   [ "$BRIDGE_HOST" = 127.0.0.1 ] || return 0
-  lines=$(bridge_call dns 2>/dev/null | grep -E '^[[:space:]]*(nameserver|search|domain|options)([[:space:]]|$)') || return 0
+  lines=$(bridge_call dns 2>/dev/null | grep -E "$RESOLV_KEYS") || return 0
+  # Without a nameserver the container would resolve nothing at all.
+  [ -n "$(printf '%s\n' "$lines" | nameservers)" ] || return 0
   [ "$lines" != "$(cat "$RESOLV_CONF" 2>/dev/null)" ] || return 0
   if { printf '%s\n' "$lines" >"$RESOLV_CONF"; } 2>/dev/null \
     || printf '%s\n' "$lines" | sudo -n tee "$RESOLV_CONF" >/dev/null 2>&1; then
