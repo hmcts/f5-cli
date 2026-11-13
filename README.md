@@ -133,14 +133,12 @@ For a devcontainer:
 ```
 
 f5-cli knows it's in a container from `/.dockerenv`, `/run/.containerenv`,
-`REMOTE_CONTAINERS` or `CODESPACES` (`F5_IN_CONTAINER=0|1` overrides that),
-and `f5-cli bridge mode` prints `container` or `host` accordingly. Tools that
-need to know whether f5-cli will forward should ask it with `f5-cli bridge
-mode` rather than repeat the detection. It reaches the host at
-`host.docker.internal` when that resolves and the bridge answers there, as on
-Docker Desktop, and otherwise at `127.0.0.1`, which is the host's own loopback
-for a container on the host's network (`--network=host`, as Linux
-devcontainers often are). `F5_BRIDGE_HOST` overrides it.
+`REMOTE_CONTAINERS` or `CODESPACES` (`F5_IN_CONTAINER=0|1` overrides that).
+It reaches the host at `host.docker.internal` when that resolves and the
+bridge answers there, as on Docker Desktop, and otherwise at `127.0.0.1`,
+which is the host's own loopback for a container on the host's network
+(`--network=host`, as Linux devcontainers often are). `F5_BRIDGE_HOST`
+overrides it.
 
 ```sh
 f5-cli bridge status   # in the container: 0 answers, 1 set up but not answering, 2 not set up
@@ -148,29 +146,13 @@ f5-cli bridge status   # in the container: 0 answers, 1 set up but not answering
 
 **DNS.** On a Linux host, `svpn` points the host's `/etc/resolv.conf` at the
 VPN's DNS servers, but a container on the host's network that resolves through
-systemd-resolved's stub (`127.0.0.53`) never learns them, so internal names
-fail there even with the tunnel up. `f5-cli dns` prints the host's
-`nameserver`, `search`, `domain` and `options` lines, and in the container
-`f5-cli dns --apply` writes them to its `/etc/resolv.conf` — in place, since
-Docker bind-mounts that file — as root or with `sudo` that needs no password.
-Set `F5_BRIDGE_SYNC_DNS=1` in the container's environment to do that after
-every `up` and `down`; `up` exits 0 when already connected, so it also repairs
-stale DNS. It is off by default because copying the host's DNS only makes
-sense with `--network=host`, and f5-cli ignores it in the config file, which
-every container with the mount shares. In a devcontainer:
-
-```jsonc
-"containerEnv": { "F5_BRIDGE_SYNC_DNS": "1" }
-```
-
-Even then, f5-cli copies only when it reached the bridge at `127.0.0.1`, which
-means the container shares the host's network, or at an `F5_BRIDGE_HOST` you
-set; over `host.docker.internal` it leaves DNS alone. It also skips the copy
-after an `up` or `down` that failed, and the host passes on nothing while its
-`/etc/resolv.conf` still names the VPN's servers after `svpn` has died.
-
-A macOS host has nothing to copy — Docker Desktop resolves through the host
-itself — so there `dns` prints nothing and `--apply` leaves the file alone.
+systemd-resolved's stub (`127.0.0.53`) never learns them. So after a bridged
+`up` or `down` that succeeds, f5-cli in the container copies the host's
+`nameserver`, `search`, `domain` and `options` lines into its own
+`/etc/resolv.conf` — in place, since Docker bind-mounts that file — as root or
+with `sudo` that needs no password. It does that only when it reached the
+bridge at `127.0.0.1`, which means the container shares the host's network. A
+macOS host has nothing to copy: Docker Desktop resolves through the host.
 
 The bridge listens on the host's `127.0.0.1` only, runs nothing but those
 commands (and `version`), with no arguments, and only for a caller with the
@@ -195,7 +177,6 @@ same name override it. Everything is optional — see
 | `F5_EPI` | macOS only: `/Applications/F5 Endpoint Inspector.app` |
 | `F5_BRIDGE_HOST` | in a container: `host.docker.internal` if the bridge answers there, else `127.0.0.1` |
 | `F5_BRIDGE_FILE` | `~/.config/f5-cli/bridge` — the bridge's port and token |
-| `F5_BRIDGE_SYNC_DNS` | `0` — in a container, `1` copies the host's DNS after `up` and `down`; environment only |
 | `F5_CLI_NETWORK_WAIT` | `0` — seconds `up` waits for the portal to resolve |
 
 ## How it works
