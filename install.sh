@@ -14,11 +14,11 @@ set -euo pipefail
 
 # Piped from curl, the script has no path of its own and no checkout beside it: fetch the repo
 # (F5_CLI_REF picks a branch, tag or commit) and run that copy's install.sh.
-if [ -z "${BASH_SOURCE[0]:-}" ]; then
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
   TMP=$(mktemp -d)
   trap 'rm -rf "$TMP"' EXIT
   URL=https://github.com/hmcts/f5-cli/archive/${F5_CLI_REF:-master}.tar.gz
-  curl -fsSL "$URL" | tar -xz -C "$TMP" --strip-components=1 \
+  curl --proto '=https' -fsSL "$URL" | tar -xz -C "$TMP" --strip-components=1 \
     || { echo "install.sh: could not download f5-cli from $URL" >&2; exit 1; }
   bash "$TMP/install.sh" "$@" </dev/null
   exit
