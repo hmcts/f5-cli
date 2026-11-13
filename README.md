@@ -48,6 +48,12 @@ cd f5-cli
 ./install.sh --bridge      # ...and lets a container on this machine drive it
 ```
 
+Or without cloning, the same options after `--`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/hmcts/f5-cli/master/install.sh | bash -s -- --bridge
+```
+
 `--autostart` and `--bridge` are independent: use either, both or neither.
 `--prefix DIR` installs somewhere other than `~/.local`.
 `./install.sh --uninstall` removes it; add `--purge` to also delete the browser

@@ -7,9 +7,25 @@
 #       host. Either, both or neither.
 #   ./install.sh --uninstall [--purge]
 #       remove; --purge also deletes the browser profile, session and config
+#
+# Or without a checkout:
+#   curl -fsSL https://raw.githubusercontent.com/hmcts/f5-cli/master/install.sh | bash -s -- --bridge
 set -euo pipefail
 
+# Piped from curl, the script has no path of its own and no checkout beside it: fetch the repo
+# (F5_CLI_REF picks a branch, tag or commit) and run that copy's install.sh.
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+  TMP=$(mktemp -d)
+  trap 'rm -rf "$TMP"' EXIT
+  URL=https://github.com/hmcts/f5-cli/archive/${F5_CLI_REF:-master}.tar.gz
+  curl --proto '=https' -fsSL "$URL" | tar -xz -C "$TMP" --strip-components=1 \
+    || { echo "install.sh: could not download f5-cli from $URL" >&2; exit 1; }
+  bash "$TMP/install.sh" "$@" </dev/null
+  exit
+fi
+
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
 OS=$(uname -s)
 PREFIX=$HOME/.local
 AUTOSTART=0
@@ -43,7 +59,7 @@ while [ $# -gt 0 ]; do
     --bridge-port=*) BRIDGE_PORT=${1#--bridge-port=} ;;
     --uninstall) UNINSTALL=1 ;;
     --purge)     PURGE=1 ;;
-    -h|--help)   sed -n '2,9s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,12s/^# \{0,1\}//p' "$0"; exit 0 ;;
     *)           die "unknown option: $1" ;;
   esac
   shift

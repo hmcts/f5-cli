@@ -16,6 +16,14 @@ jobs:
           systemd-analyze verify --user systemd/f5-cli-bridge.service || true
       - name: bridge
         run: bash tests/bridge.test.sh
+      # As `curl … install.sh | bash -s --` does, against this commit's tarball.
+      - name: install through a pipe
+        env:
+          F5_CLI_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          cd "$(mktemp -d)"
+          bash -s -- --prefix "$PWD/prefix" <"$GITHUB_WORKSPACE/install.sh"
+          "$PWD/prefix/bin/f5-cli" version
 
   macos:
     runs-on: macos-latest
@@ -28,3 +36,10 @@ jobs:
       # The bridge's server runs on macOS's own python3 (3.9 with the Command Line Tools).
       - name: bridge
         run: /bin/bash tests/bridge.test.sh
+      - name: install through a pipe
+        env:
+          F5_CLI_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          cd "$(mktemp -d)"
+          /bin/bash -s -- --prefix "$PWD/prefix" <"$GITHUB_WORKSPACE/install.sh"
+          "$PWD/prefix/bin/f5-cli" version
